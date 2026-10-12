@@ -30,7 +30,18 @@ func main() {
 	}
 	defer store.Close()
 
-	h := connector.NewHandlers(store, logger)
+	cache := connector.NewRedis(secrets.RedisAddr, secrets.RedisPassword)
+	if cache != nil {
+		if err := cache.Ping(ctx); err != nil {
+			logger.Warn("redis unavailable, continuing without cache", "err", err)
+			cache = nil
+		} else {
+			logger.Info("redis connected")
+			defer cache.Close()
+		}
+	}
+
+	h := connector.NewHandlers(store, cache, logger)
 	mux := http.NewServeMux()
 	h.Register(mux)
 

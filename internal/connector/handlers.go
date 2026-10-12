@@ -26,11 +26,13 @@ type Handlers struct {
 	mu      sync.RWMutex
 	byID    map[string]*ConnectRequest
 	byToKey map[string][]string
+	cache   *RedisCache
 }
 
-func NewHandlers(store *Store, logger *slog.Logger) *Handlers {
+func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
 	return &Handlers{
 		store:   store,
+		cache:   cache,
 		logger:  logger,
 		byID:    make(map[string]*ConnectRequest),
 		byToKey: make(map[string][]string),
@@ -79,6 +81,7 @@ func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	_ = h.cache.DelPeer(r.Context(), req.Key)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
@@ -91,6 +94,14 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if h.cache != nil {
+		if p, err := h.cache.GetPeer(r.Context(), key); err == nil {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(p)
+			return
+		}
+	}
+
 	addr, state, _, err := h.store.GetPeer(r.Context(), key)
 	if err != nil {
 		if err.Error() == "peer not found" {
@@ -101,6 +112,8 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+
+	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state}, 30*time.Second)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(peerResponse{Key: key, Address: addr, State: state})
@@ -135,6 +148,8 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Status:      "pending",
 		Created:     time.Now(),
 	}
+
+	_ = h.cache.SetRequest(r.Context(), cr, 10*time.Minute)
 
 	h.mu.Lock()
 	h.byID[cr.ID] = cr
@@ -183,6 +198,8 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 	cr.Status = "accepted"
 	h.mu.Unlock()
 
+	_ = h.cache.UpdateRequestStatus(r.Context(), id, "accepted")
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
 }
@@ -199,6 +216,8 @@ func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 	}
 	cr.Status = "rejected"
 	h.mu.Unlock()
+
+	_ = h.cache.UpdateRequestStatus(r.Context(), id, "rejected")
 
 	h.logger.Info("request rejected", "id", id)
 	w.Header().Set("Content-Type", "application/json")
