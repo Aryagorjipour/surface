@@ -30,7 +30,7 @@ func main() {
 	}
 	defer store.Close()
 
-	h := connector.NewHandlers(store)
+	h := connector.NewHandlers(store, logger)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
