@@ -17,6 +17,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	shutdown, err := connector.InitOTEL(ctx, "connector", logger)
+	if err != nil {
+		logger.Warn("otel init failed, continuing without traces", "err", err)
+	} else {
+		defer shutdown(context.Background())
+	}
 	secrets, err := connector.Load(ctx)
 	if err != nil {
 		logger.Error("failed to load secrets", "err", err)
@@ -30,15 +36,21 @@ func main() {
 	}
 	defer store.Close()
 
-	cache := connector.NewRedis(secrets.RedisAddr, secrets.RedisPassword)
-	if cache != nil {
-		if err := cache.Ping(ctx); err != nil {
+	var cache *connector.RedisCache
+	if secrets.RedisAddr != "" && secrets.RedisAddr != "redis:6379" {
+		cache = connector.NewRedis(secrets.RedisAddr, secrets.RedisPassword)
+		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err := cache.Ping(pingCtx)
+		cancel()
+		if err != nil {
 			logger.Warn("redis unavailable, continuing without cache", "err", err)
 			cache = nil
 		} else {
 			logger.Info("redis connected")
 			defer cache.Close()
 		}
+	} else {
+		logger.Info("redis disabled")
 	}
 
 	h := connector.NewHandlers(store, cache, logger)

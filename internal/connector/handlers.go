@@ -9,6 +9,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type ConnectRequest struct {
@@ -40,13 +41,13 @@ func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers
 }
 
 func (h *Handlers) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /peers", h.handleUpsertPeer)
-	mux.HandleFunc("GET /peers/{key}", h.handleGetPeer)
-	mux.HandleFunc("POST /connect", h.handleConnect)
-	mux.HandleFunc("GET /pending", h.handlePending)
-	mux.HandleFunc("POST /requests/{id}/accept", h.handleAccept)
-	mux.HandleFunc("POST /requests/{id}/reject", h.handleReject)
-	mux.HandleFunc("GET /requests/{id}", h.handleRequestStatus)
+	mux.Handle("POST /peers", otelhttp.NewHandler(http.HandlerFunc(h.handleUpsertPeer), "POST /peers"))
+	mux.Handle("GET /peers/{key}", otelhttp.NewHandler(http.HandlerFunc(h.handleGetPeer), "GET /peers/{key}"))
+	mux.Handle("POST /connect", otelhttp.NewHandler(http.HandlerFunc(h.handleConnect), "POST /connect"))
+	mux.Handle("GET /pending", otelhttp.NewHandler(http.HandlerFunc(h.handlePending), "GET /pending"))
+	mux.Handle("POST /requests/{id}/accept", otelhttp.NewHandler(http.HandlerFunc(h.handleAccept), "POST /requests/{id}/accept"))
+	mux.Handle("POST /requests/{id}/reject", otelhttp.NewHandler(http.HandlerFunc(h.handleReject), "POST /requests/{id}/reject"))
+	mux.Handle("GET /requests/{id}", otelhttp.NewHandler(http.HandlerFunc(h.handleRequestStatus), "GET /requests/{id}"))
 }
 
 type peerRequest struct {
