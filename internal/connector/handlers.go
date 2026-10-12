@@ -2,29 +2,49 @@ package connector
 
 import (
 	"encoding/json"
-	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
+
+	"log/slog"
 
 	"github.com/google/uuid"
 )
 
 type ConnectRequest struct {
-	ID          string    `json:request_id`
-	FromKey     string    `json:from_key`
-	FromAddress string    `json:from_address`
-	ToKey       string    `json:to_key`
-	Status      string    `json:status`
-	Created     time.Time `json:created`
+	ID          string    `json:"request_id"`
+	FromKey     string    `json:"from_key"`
+	FromAddress string    `json:"from_address"`
+	ToKey       string    `json:"to_key"`
+	Status      string    `json:"status"`
+	Created     time.Time `json:"created"`
 }
 
 type Handlers struct {
 	store   *Store
 	logger  *slog.Logger
 	mu      sync.RWMutex
-	pending map[string][]ConnectRequest
+	byID    map[string]*ConnectRequest
+	byToKey map[string][]string
+}
+
+func NewHandlers(store *Store, logger *slog.Logger) *Handlers {
+	return &Handlers{
+		store:   store,
+		logger:  logger,
+		byID:    make(map[string]*ConnectRequest),
+		byToKey: make(map[string][]string),
+	}
+}
+
+func (h *Handlers) Register(mux *http.ServeMux) {
+	mux.HandleFunc("POST /peers", h.handleUpsertPeer)
+	mux.HandleFunc("GET /peers/{key}", h.handleGetPeer)
+	mux.HandleFunc("POST /connect", h.handleConnect)
+	mux.HandleFunc("GET /pending", h.handlePending)
+	mux.HandleFunc("POST /requests/{id}/accept", h.handleAccept)
+	mux.HandleFunc("POST /requests/{id}/reject", h.handleReject)
+	mux.HandleFunc("GET /requests/{id}", h.handleRequestStatus)
 }
 
 type peerRequest struct {
@@ -37,35 +57,6 @@ type peerResponse struct {
 	Key     string `json:"key"`
 	Address string `json:"address"`
 	State   string `json:"state"`
-}
-
-type connectRequest struct {
-	FromKey     string `json:"from_key"`
-	ToKey       string `json:"to_key"`
-	FromAddress string `json:"from_address"`
-}
-
-type connectResponse struct {
-	RequestID string `json:"request_id"`
-	Status    string `json:"status"`
-}
-
-func NewHandlers(store *Store, logger *slog.Logger) *Handlers {
-	return &Handlers{
-		store:   store,
-		logger:  logger,
-		pending: make(map[string][]ConnectRequest),
-	}
-}
-
-func (h *Handlers) Register(mux *http.ServeMux) {
-	mux.HandleFunc("POST /peers", h.handleUpsertPeer)
-	mux.HandleFunc("GET /peers/{key}", h.handleGetPeer)
-	mux.HandleFunc("POST /connect", h.handleConnect)
-	mux.HandleFunc("GET /pending", h.handlePending)
-	mux.HandleFunc("POST /requests/{id}/accept", h.handleAccept)
-	mux.HandleFunc("POST /requests/{id}/reject", h.handleReject)
-	mux.HandleFunc("GET /requests/{id}", h.handleRequestStatus)
 }
 
 func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +75,7 @@ func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.UpsertPeer(r.Context(), req.Key, req.Address, req.State); err != nil {
+		h.logger.Error("upsert failed", "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
@@ -101,24 +93,21 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 
 	addr, state, _, err := h.store.GetPeer(r.Context(), key)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
+		if err.Error() == "peer not found" {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
+		h.logger.Error("get peer failed", "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peerResponse{
-		Key:     key,
-		Address: addr,
-		State:   state,
-	})
+	json.NewEncoder(w).Encode(peerResponse{Key: key, Address: addr, State: state})
 }
 
 func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
-	var req connectRequest
+	var req ConnectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json", http.StatusBadRequest)
 		return
@@ -138,12 +127,25 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := uuid.NewString()
+	cr := &ConnectRequest{
+		ID:          uuid.NewString(),
+		FromKey:     req.FromKey,
+		FromAddress: req.FromAddress,
+		ToKey:       req.ToKey,
+		Status:      "pending",
+		Created:     time.Now(),
+	}
+
+	h.mu.Lock()
+	h.byID[cr.ID] = cr
+	h.byToKey[req.ToKey] = append(h.byToKey[req.ToKey], cr.ID)
+	h.mu.Unlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(connectResponse{
-		RequestID: id,
-		Status:    "pending",
+	json.NewEncoder(w).Encode(map[string]string{
+		"request_id": cr.ID,
+		"status":     cr.Status,
 	})
 }
 
@@ -155,48 +157,30 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mu.RLock()
-	list := h.pending[key]
-	h.mu.RUnlock()
-
+	ids := h.byToKey[key]
 	var out []ConnectRequest
-	for _, connectRequest := range list {
-		if connectRequest.Status == "pending" {
-			out = append(out, connectRequest)
+	for _, id := range ids {
+		if cr, ok := h.byID[id]; ok && cr.Status == "pending" {
+			out = append(out, *cr)
 		}
 	}
+	h.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
 }
 
-func (h *Handlers) findRequest(id string) (*ConnectRequest, string) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for toKey, list := range h.pending {
-		for i := range list {
-			if list[i].ID == id {
-				return &list[i], toKey
-			}
-		}
-	}
-	return nil, ""
-}
-
 func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	cr, toKey := h.findRequest(id)
-	if cr == nil {
+
+	h.mu.Lock()
+	cr, ok := h.byID[id]
+	if !ok {
+		h.mu.Unlock()
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
-
-	h.mu.Lock()
-	for i := range h.pending[toKey] {
-		if h.pending[toKey][i].ID == id {
-			h.pending[toKey][i].Status = "accepted"
-			break
-		}
-	}
+	cr.Status = "accepted"
 	h.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -205,29 +189,29 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	cr, toKey := h.findRequest(id)
-	if cr == nil {
+
+	h.mu.Lock()
+	cr, ok := h.byID[id]
+	if !ok {
+		h.mu.Unlock()
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
-
-	h.mu.Lock()
-	for i := range h.pending[toKey] {
-		if h.pending[toKey][i].ID == id {
-			h.pending[toKey][i].Status = "rejected"
-			break
-		}
-	}
+	cr.Status = "rejected"
 	h.mu.Unlock()
 
+	h.logger.Info("request rejected", "id", id)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "rejected"})
 }
 
 func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	cr, _ := h.findRequest(id)
-	if cr == nil {
+
+	h.mu.RLock()
+	cr, ok := h.byID[id]
+	h.mu.RUnlock()
+	if !ok {
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
