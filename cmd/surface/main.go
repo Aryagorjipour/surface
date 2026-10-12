@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"log/slog"
@@ -29,6 +30,19 @@ type connectResp struct {
 	Status    string `json:"status"`
 }
 
+type app struct {
+	base       string
+	myKey      string
+	listenAddr string
+	logger     *slog.Logger
+	ctx        context.Context
+	cancel     context.CancelFunc
+
+	mu       sync.Mutex
+	inChat   bool
+	chatConn *websocket.Conn
+}
+
 func main() {
 	logger := shared.NewLogger("surface")
 	if len(os.Args) < 3 {
@@ -43,19 +57,28 @@ func main() {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	a := &app{
+		base:       base,
+		myKey:      myKey,
+		listenAddr: listenAddr,
+		logger:     logger,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
 
-	go serveWS(ctx, listenAddr, logger)
+	go a.serveWS()
 
-	if err := register(base, myKey, listenAddr, "available"); err != nil {
+	if err := a.register("available"); err != nil {
 		logger.Error("register failed", "err", err)
 		os.Exit(1)
 	}
 	logger.Info("registered", "key", myKey, "addr", listenAddr)
 
-	go pollPending(ctx, base, myKey)
+	go a.pollPending()
 
 	fmt.Println("commands: lookup <key> | connect <key> | accept <id> | reject <id> | quit")
+	fmt.Println("(in chat: just type messages; /quit leaves chat)")
+
 	sc := bufio.NewScanner(os.Stdin)
 	if sc.Err() != nil {
 		logger.Error("BUFIO scanner failed", "key", myKey, "addr", listenAddr)
@@ -68,6 +91,28 @@ func main() {
 		if line == "" {
 			continue
 		}
+
+		a.mu.Lock()
+		chatting := a.inChat
+		conn := a.chatConn
+		a.mu.Unlock()
+
+		if chatting && conn != nil {
+			if line == "/quit" {
+				conn.Close(websocket.StatusNormalClosure, "bye")
+				a.mu.Lock()
+				a.inChat = false
+				a.chatConn = nil
+				a.mu.Unlock()
+				fmt.Println("left chat")
+				continue
+			}
+			if err := conn.Write(a.ctx, websocket.MessageText, []byte(line)); err != nil {
+				fmt.Println("send failed:", err)
+			}
+			continue
+		}
+
 		parts := strings.Fields(line)
 		switch parts[0] {
 		case "quit", "exit":
@@ -78,7 +123,7 @@ func main() {
 				fmt.Println("usage: lookup <key>")
 				continue
 			}
-			p, err := lookup(base, parts[1])
+			p, err := a.lookup(parts[1])
 			if err != nil {
 				fmt.Println("lookup error:", err)
 				continue
@@ -89,7 +134,7 @@ func main() {
 				fmt.Println("usage: connect <key>")
 				continue
 			}
-			if err := doConnect(ctx, base, myKey, listenAddr, parts[1]); err != nil {
+			if err := a.doConnect(parts[1]); err != nil {
 				fmt.Println("connect error:", err)
 			}
 		case "accept":
@@ -97,17 +142,17 @@ func main() {
 				fmt.Println("usage: accept <request-id>")
 				continue
 			}
-			if err := postAction(base, parts[1], "accept"); err != nil {
+			if err := a.postAction(parts[1], "accept"); err != nil {
 				fmt.Println("accept error:", err)
 			} else {
-				fmt.Println("accepted")
+				fmt.Println("accepted — waiting for peer to dial")
 			}
 		case "reject":
 			if len(parts) < 2 {
 				fmt.Println("usage: reject <request-id>")
 				continue
 			}
-			if err := postAction(base, parts[1], "reject"); err != nil {
+			if err := a.postAction(parts[1], "reject"); err != nil {
 				fmt.Println("reject error:", err)
 			} else {
 				fmt.Println("rejected")
@@ -118,11 +163,11 @@ func main() {
 	}
 }
 
-func register(base, key, addr, state string) error {
+func (a *app) register(state string) error {
 	body, _ := json.Marshal(map[string]string{
-		"key": key, "address": addr, "state": state,
+		"key": a.myKey, "address": a.listenAddr, "state": state,
 	})
-	resp, err := http.Post(base+"/peers", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(a.base+"/peers", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -134,8 +179,8 @@ func register(base, key, addr, state string) error {
 	return nil
 }
 
-func lookup(base, key string) (*peer, error) {
-	resp, err := http.Get(base + "/peers/" + key)
+func (a *app) lookup(key string) (*peer, error) {
+	resp, err := http.Get(a.base + "/peers/" + key)
 	if err != nil {
 		return nil, err
 	}
@@ -153,16 +198,16 @@ func lookup(base, key string) (*peer, error) {
 	return &p, nil
 }
 
-func pollPending(ctx context.Context, base, myKey string) {
+func (a *app) pollPending() {
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	seen := map[string]bool{}
 	for {
 		select {
-		case <-ctx.Done():
+		case <-a.ctx.Done():
 			return
 		case <-tick.C:
-			resp, err := http.Get(base + "/pending?key=" + myKey)
+			resp, err := http.Get(a.base + "/pending?key=" + a.myKey)
 			if err != nil {
 				continue
 			}
@@ -182,8 +227,8 @@ func pollPending(ctx context.Context, base, myKey string) {
 	}
 }
 
-func postAction(base, id, action string) error {
-	resp, err := http.Post(base+"/requests/"+id+"/"+action, "application/json", nil)
+func (a *app) postAction(id, action string) error {
+	resp, err := http.Post(a.base+"/requests/"+id+"/"+action, "application/json", nil)
 	if err != nil {
 		return err
 	}
@@ -195,8 +240,8 @@ func postAction(base, id, action string) error {
 	return nil
 }
 
-func doConnect(ctx context.Context, base, myKey, myAddr, target string) error {
-	p, err := lookup(base, target)
+func (a *app) doConnect(target string) error {
+	p, err := a.lookup(target)
 	if err != nil {
 		return err
 	}
@@ -205,9 +250,9 @@ func doConnect(ctx context.Context, base, myKey, myAddr, target string) error {
 	}
 
 	body, _ := json.Marshal(map[string]string{
-		"from_key": myKey, "to_key": target, "from_address": myAddr,
+		"from_key": a.myKey, "to_key": target, "from_address": a.listenAddr,
 	})
-	resp, err := http.Post(base+"/connect", "application/json", bytes.NewReader(body))
+	resp, err := http.Post(a.base+"/connect", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -220,7 +265,7 @@ func doConnect(ctx context.Context, base, myKey, myAddr, target string) error {
 
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
-		resp, err := http.Get(base + "/requests/" + cr.RequestID)
+		resp, err := http.Get(a.base + "/requests/" + cr.RequestID)
 		if err != nil {
 			continue
 		}
@@ -230,7 +275,7 @@ func doConnect(ctx context.Context, base, myKey, myAddr, target string) error {
 		st, _ := status["status"].(string)
 		if st == "accepted" {
 			fmt.Println("accepted — dialing", p.Address)
-			return dialAndChat(ctx, p.Address)
+			return a.dialAndChat(p.Address)
 		}
 		if st == "rejected" {
 			return fmt.Errorf("rejected")
@@ -239,60 +284,59 @@ func doConnect(ctx context.Context, base, myKey, myAddr, target string) error {
 	return fmt.Errorf("timeout waiting for accept")
 }
 
-func serveWS(ctx context.Context, addr string, logger *slog.Logger) {
+func (a *app) serveWS() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
-		defer c.Close(websocket.StatusNormalClosure, "")
-		fmt.Println("\n>>> peer connected")
-		chatLoop(ctx, c)
+		fmt.Println("\n>>> peer connected — type messages (/quit to leave)")
+		a.enterChat(c)
 	})
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: a.listenAddr, Handler: mux}
 	go func() {
-		<-ctx.Done()
+		<-a.ctx.Done()
 		srv.Shutdown(context.Background())
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logger.Error("ws listen failed", "err", err)
+		a.logger.Error("ws listen failed", "err", err)
 	}
 }
 
-func dialAndChat(ctx context.Context, addr string) error {
-	c, _, err := websocket.Dial(ctx, "ws://"+addr, nil)
+func (a *app) dialAndChat(addr string) error {
+	c, _, err := websocket.Dial(a.ctx, "ws://"+addr, nil)
 	if err != nil {
 		return err
 	}
-	defer c.Close(websocket.StatusNormalClosure, "")
-	fmt.Println("connected — type messages (empty line ignored)")
-	chatLoop(ctx, c)
+	fmt.Println("connected — type messages (/quit to leave)")
+	a.enterChat(c)
 	return nil
 }
 
-func chatLoop(ctx context.Context, c *websocket.Conn) {
+func (a *app) enterChat(c *websocket.Conn) {
+	a.mu.Lock()
+	a.inChat = true
+	a.chatConn = c
+	a.mu.Unlock()
+
 	go func() {
-		sc := bufio.NewScanner(os.Stdin)
-		if sc.Err() != nil {
-			fmt.Println("Request failed, please try again")
-		}
-		for sc.Scan() {
-			msg := sc.Text()
-			if strings.TrimSpace(msg) == "" {
-				continue
+		defer func() {
+			c.Close(websocket.StatusNormalClosure, "")
+			a.mu.Lock()
+			if a.chatConn == c {
+				a.inChat = false
+				a.chatConn = nil
 			}
-			if err := c.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
+			a.mu.Unlock()
+			fmt.Println("\nchat ended")
+		}()
+		for {
+			_, data, err := c.Read(a.ctx)
+			if err != nil {
 				return
 			}
+			fmt.Printf("peer: %s\n> ", string(data))
 		}
 	}()
-	for {
-		_, data, err := c.Read(ctx)
-		if err != nil {
-			fmt.Println("\n chat closed:", err)
-			return
-		}
-		fmt.Printf("peer: %s\n> ", string(data))
-	}
 }
