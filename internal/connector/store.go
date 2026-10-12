@@ -8,10 +8,13 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
-	_ "modernc.org/sqlite" // required for local file: DSNs in tests
+	_ "modernc.org/sqlite"
 )
 
 type Store struct {
@@ -25,7 +28,14 @@ func Open(ctx context.Context, url, token string, encKey []byte) (*Store, error)
 	}
 
 	dsn := url
-	if token != "" {
+	isFile := strings.HasPrefix(url, "file:")
+
+	if isFile {
+		path := strings.TrimPrefix(url, "file:")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, fmt.Errorf("create data dir: %w", err)
+		}
+	} else if token != "" {
 		dsn = fmt.Sprintf("%s?authToken=%s", url, token)
 	}
 
