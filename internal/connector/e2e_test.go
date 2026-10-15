@@ -221,10 +221,11 @@ func getJSON(ctx context.Context, url string, want int, out any) error {
 	return doJSON(ctx, http.MethodGet, url, nil, want, out)
 }
 
-func doJSON(ctx context.Context, method, url string, in any, want int, out any) error {
+func doJSON(ctx context.Context, method, url string, in any, want int, out any) (err error) {
 	var body io.Reader
 	if in != nil {
-		raw, err := json.Marshal(in)
+		var raw []byte
+		raw, err = json.Marshal(in)
 		if err != nil {
 			return err
 		}
@@ -241,7 +242,11 @@ func doJSON(ctx context.Context, method, url string, in any, want int, out any) 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -250,7 +255,7 @@ func doJSON(ctx context.Context, method, url string, in any, want int, out any) 
 		return errors.New("http status " + http.StatusText(resp.StatusCode))
 	}
 	if out != nil && len(bytes.TrimSpace(raw)) > 0 {
-		if err := json.Unmarshal(raw, out); err != nil {
+		if err = json.Unmarshal(raw, out); err != nil {
 			return err
 		}
 	}
