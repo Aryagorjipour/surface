@@ -45,13 +45,17 @@ func Open(ctx context.Context, url, token string, encKey []byte) (*Store, error)
 	}
 
 	if err := db.PingContext(ctx); err != nil {
-		db.Close()
+		if cerr := db.Close(); cerr != nil {
+			return nil, fmt.Errorf("ping turso: %w; close: %v", err, cerr)
+		}
 		return nil, fmt.Errorf("ping turso: %w", err)
 	}
 
 	s := &Store{db: db, encKey: encKey}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
+		if cerr := db.Close(); cerr != nil {
+			return nil, fmt.Errorf("migrate: %w; close: %v", err, cerr)
+		}
 		return nil, err
 	}
 	return s, nil

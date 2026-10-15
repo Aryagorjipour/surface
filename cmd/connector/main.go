@@ -21,7 +21,11 @@ func main() {
 	if err != nil {
 		logger.Warn("otel init failed, continuing without traces", "err", err)
 	} else {
-		defer shutdown(context.Background())
+		defer func() {
+			if err := shutdown(context.Background()); err != nil {
+				logger.Warn("otel shutdown", "err", err)
+			}
+		}()
 	}
 	secrets, err := connector.Load(ctx)
 	if err != nil {
@@ -34,7 +38,11 @@ func main() {
 		logger.Error("failed to open store", "err", err)
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("store close", "err", err)
+		}
+	}()
 
 	var cache *connector.RedisCache
 	if secrets.RedisAddr != "" && secrets.RedisAddr != "redis:6379" {
@@ -47,7 +55,11 @@ func main() {
 			cache = nil
 		} else {
 			logger.Info("redis connected")
-			defer cache.Close()
+			defer func() {
+				if err := cache.Close(); err != nil {
+					logger.Error("redis close", "err", err)
+				}
+			}()
 		}
 	} else {
 		logger.Info("redis disabled")
