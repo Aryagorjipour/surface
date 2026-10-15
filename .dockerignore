@@ -4,3 +4,9 @@ data
 bin
 *.md
 LICENSE
+*.exe
+*.test
+*.out
+.env
+.env.*
+*.log
