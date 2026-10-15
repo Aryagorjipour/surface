@@ -14,6 +14,11 @@ import (
 
 func main() {
 	logger := shared.NewLogger("connector")
+	cfg, err := connector.ParseLimitConfig(os.LookupEnv)
+	if err != nil {
+		logger.Error("refused startup", "err", err)
+		os.Exit(1)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -66,6 +71,7 @@ func main() {
 	}
 
 	h := connector.NewHandlers(store, cache, logger)
+	h.SetLimits(connector.NewLimits(cfg))
 	mux := http.NewServeMux()
 	h.Register(mux)
 

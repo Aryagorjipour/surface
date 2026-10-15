@@ -2,11 +2,12 @@ package connector
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
-
-	"log/slog"
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -22,12 +23,14 @@ type ConnectRequest struct {
 }
 
 type Handlers struct {
-	store   *Store
-	logger  *slog.Logger
-	mu      sync.RWMutex
-	byID    map[string]*ConnectRequest
-	byToKey map[string][]string
-	cache   *RedisCache
+	store      *Store
+	logger     *slog.Logger
+	mu         sync.RWMutex
+	byID       map[string]*ConnectRequest
+	byToKey    map[string][]string
+	cache      *RedisCache
+	limits     *Limits
+	limitsOnce sync.Once
 }
 
 func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
@@ -40,14 +43,61 @@ func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers
 	}
 }
 
+// SetLimits installs process limits before the first request.
+func (h *Handlers) SetLimits(l *Limits) {
+	h.limits = l
+}
+
+func (h *Handlers) lim() *Limits {
+	h.limitsOnce.Do(func() {
+		if h.limits == nil {
+			h.limits = NewLimits(DefaultConfig())
+		}
+	})
+	return h.limits
+}
+
 func (h *Handlers) Register(mux *http.ServeMux) {
-	mux.Handle("POST /peers", otelhttp.NewHandler(http.HandlerFunc(h.handleUpsertPeer), "POST /peers"))
-	mux.Handle("GET /peers/{key}", otelhttp.NewHandler(http.HandlerFunc(h.handleGetPeer), "GET /peers/{key}"))
-	mux.Handle("POST /connect", otelhttp.NewHandler(http.HandlerFunc(h.handleConnect), "POST /connect"))
-	mux.Handle("GET /pending", otelhttp.NewHandler(http.HandlerFunc(h.handlePending), "GET /pending"))
-	mux.Handle("POST /requests/{id}/accept", otelhttp.NewHandler(http.HandlerFunc(h.handleAccept), "POST /requests/{id}/accept"))
-	mux.Handle("POST /requests/{id}/reject", otelhttp.NewHandler(http.HandlerFunc(h.handleReject), "POST /requests/{id}/reject"))
-	mux.Handle("GET /requests/{id}", otelhttp.NewHandler(http.HandlerFunc(h.handleRequestStatus), "GET /requests/{id}"))
+	h.route(mux, "POST /peers", "register", h.handleUpsertPeer)
+	h.route(mux, "GET /peers/{key}", "lookup", h.handleGetPeer)
+	h.route(mux, "POST /connect", "connect", h.handleConnect)
+	h.route(mux, "GET /pending", "pending", h.handlePending)
+	h.route(mux, "POST /requests/{id}/accept", "accept", h.handleAccept)
+	h.route(mux, "POST /requests/{id}/reject", "reject", h.handleReject)
+	h.route(mux, "GET /requests/{id}", "status", h.handleRequestStatus)
+}
+
+func (h *Handlers) route(mux *http.ServeMux, pattern, op string, fn http.HandlerFunc) {
+	traced := otelhttp.NewHandler(fn, pattern)
+	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+		if !h.lim().AllowSource(SourceHost(r.RemoteAddr)) {
+			h.reject(w, http.StatusTooManyRequests, op, "too many requests")
+			return
+		}
+		traced.ServeHTTP(w, ScrubForTrace(r, pattern))
+	})
+}
+
+func (h *Handlers) reject(w http.ResponseWriter, status int, op, class string) {
+	if h.logger != nil {
+		h.logger.Info("refused", "op", op, "class", class)
+	}
+	http.Error(w, class, status)
+}
+
+func (h *Handlers) readBody(w http.ResponseWriter, r *http.Request, op string) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(h.lim().cfg.MaxBodyBytes))
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			h.reject(w, http.StatusBadRequest, op, "request too large")
+			return nil, false
+		}
+		h.reject(w, http.StatusBadRequest, op, "invalid json")
+		return nil, false
+	}
+	return body, true
 }
 
 func (h *Handlers) writeJSON(w http.ResponseWriter, status int, v any) {
@@ -74,17 +124,21 @@ type peerResponse struct {
 }
 
 func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
+	body, ok := h.readBody(w, r, "register")
+	if !ok {
+		return
+	}
 	var req peerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	if err := json.Unmarshal(body, &req); err != nil {
+		h.reject(w, http.StatusBadRequest, "register", "invalid json")
 		return
 	}
-	if req.Key == "" || req.Address == "" || req.State == "" {
-		http.Error(w, "key, address, state required", http.StatusBadRequest)
+	if fault, ok := ValidateRegister(h.lim().cfg, req.Key, req.Address, req.State); !ok {
+		h.reject(w, fault.Status, "register", fault.Phrase)
 		return
 	}
-	if req.State != "available" && req.State != "busy" && req.State != "offline" {
-		http.Error(w, "invalid state", http.StatusBadRequest)
+	if !h.lim().AllowKey(req.Key) {
+		h.reject(w, http.StatusTooManyRequests, "register", "too many requests")
 		return
 	}
 
@@ -101,7 +155,15 @@ func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if key == "" {
-		http.Error(w, "missing key", http.StatusBadRequest)
+		h.reject(w, http.StatusBadRequest, "lookup", "missing key")
+		return
+	}
+	if fault, ok := ValidateKey(h.lim().cfg, key); !ok {
+		h.reject(w, fault.Status, "lookup", fault.Phrase)
+		return
+	}
+	if !h.lim().AllowKey(key) {
+		h.reject(w, http.StatusTooManyRequests, "lookup", "too many requests")
 		return
 	}
 
@@ -129,13 +191,21 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
-	var req ConnectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid json", http.StatusBadRequest)
+	body, ok := h.readBody(w, r, "connect")
+	if !ok {
 		return
 	}
-	if req.FromKey == "" || req.ToKey == "" || req.FromAddress == "" {
-		http.Error(w, "from_key, to_key, from_address required", http.StatusBadRequest)
+	var req ConnectRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		h.reject(w, http.StatusBadRequest, "connect", "invalid json")
+		return
+	}
+	if fault, ok := ValidateConnect(h.lim().cfg, req.FromKey, req.ToKey, req.FromAddress); !ok {
+		h.reject(w, fault.Status, "connect", fault.Phrase)
+		return
+	}
+	if !h.lim().AllowKey(req.FromKey, req.ToKey) {
+		h.reject(w, http.StatusTooManyRequests, "connect", "too many requests")
 		return
 	}
 
@@ -174,7 +244,15 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	if key == "" {
-		http.Error(w, "key query param required", http.StatusBadRequest)
+		h.reject(w, http.StatusBadRequest, "pending", "key query param required")
+		return
+	}
+	if fault, ok := ValidateKey(h.lim().cfg, key); !ok {
+		h.reject(w, fault.Status, "pending", fault.Phrase)
+		return
+	}
+	if !h.lim().AllowKey(key) {
+		h.reject(w, http.StatusTooManyRequests, "pending", "too many requests")
 		return
 	}
 
@@ -193,6 +271,10 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if fault, ok := ValidateID(h.lim().cfg, id); !ok {
+		h.reject(w, fault.Status, "accept", fault.Phrase)
+		return
+	}
 
 	h.mu.Lock()
 	cr, ok := h.byID[id]
@@ -211,6 +293,10 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if fault, ok := ValidateID(h.lim().cfg, id); !ok {
+		h.reject(w, fault.Status, "reject", fault.Phrase)
+		return
+	}
 
 	h.mu.Lock()
 	cr, ok := h.byID[id]
@@ -230,6 +316,10 @@ func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if fault, ok := ValidateID(h.lim().cfg, id); !ok {
+		h.reject(w, fault.Status, "status", fault.Phrase)
+		return
+	}
 
 	h.mu.RLock()
 	cr, ok := h.byID[id]
