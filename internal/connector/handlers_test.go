@@ -87,18 +87,18 @@ func TestRejectMalformed(t *testing.T) {
 	maxKey := strings.Repeat("k", 128)
 	maxAddr := strings.Repeat("a", 256)
 
-	rec := postJSON(mux, "/peers", peerJSON(longKey, "127.0.0.1:1", "available"))
+	rec := postMux(mux, "/peers", peerJSON(longKey, "127.0.0.1:1", "available"))
 	requirePhrase(t, rec, http.StatusBadRequest, "key too long")
 	if _, _, _, err := store.GetPeer(context.Background(), longKey); err == nil {
 		t.Fatal("long key was stored")
 	}
 
-	rec = postJSON(mux, "/peers", peerJSON("addr-key", longAddr, "available"))
+	rec = postMux(mux, "/peers", peerJSON("addr-key", longAddr, "available"))
 	requirePhrase(t, rec, http.StatusBadRequest, "address too long")
 	rec = getReq(mux, "/peers/addr-key", "")
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
 
-	rec = postJSON(mux, "/peers", peerJSON("state-key", "127.0.0.1:1", "Available"))
+	rec = postMux(mux, "/peers", peerJSON("state-key", "127.0.0.1:1", "Available"))
 	requirePhrase(t, rec, http.StatusBadRequest, "invalid state")
 	rec = getReq(mux, "/peers/state-key", "")
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
@@ -113,12 +113,12 @@ func TestRejectMalformed(t *testing.T) {
 		t.Fatalf("body read %d of %d", counter.n, len(payload))
 	}
 
-	rec = postJSON(mux, "/peers", "{")
+	rec = postMux(mux, "/peers", "{")
 	requirePhrase(t, rec, http.StatusBadRequest, "invalid json")
-	rec = postJSON(mux, "/peers", `{"key":"only"}`)
+	rec = postMux(mux, "/peers", `{"key":"only"}`)
 	requirePhrase(t, rec, http.StatusBadRequest, "key, address, state required")
 
-	rec = postJSON(mux, "/peers", peerJSON(maxKey, maxAddr, "available"))
+	rec = postMux(mux, "/peers", peerJSON(maxKey, maxAddr, "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("exact ceilings: %d %s", rec.Code, rec.Body.String())
 	}
@@ -131,7 +131,7 @@ func TestRejectMalformed(t *testing.T) {
 		{connectJSON("from", longKey, "127.0.0.1:1"), "key too long"},
 		{connectJSON("from", "target", longAddr), "address too long"},
 	} {
-		rec = postJSON(mux, "/connect", tc.body)
+		rec = postMux(mux, "/connect", tc.body)
 		requirePhrase(t, rec, http.StatusBadRequest, tc.phrase)
 		if len(h.byID) != 0 {
 			t.Fatalf("connect stored a request: %d", len(h.byID))
@@ -176,11 +176,11 @@ func TestConnectBusyStaysConflict(t *testing.T) {
 		{"busy-peer", "busy"},
 		{"offline-peer", "offline"},
 	} {
-		rec := postJSON(mux, "/peers", peerJSON(tc.key, "127.0.0.1:9", tc.state))
+		rec := postMux(mux, "/peers", peerJSON(tc.key, "127.0.0.1:9", tc.state))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("register %s: %d %s", tc.state, rec.Code, rec.Body.String())
 		}
-		rec = postJSON(mux, "/connect", connectJSON("caller", tc.key, "127.0.0.1:8"))
+		rec = postMux(mux, "/connect", connectJSON("caller", tc.key, "127.0.0.1:8"))
 		requirePhrase(t, rec, http.StatusConflict, "target not connectable")
 	}
 }
@@ -283,7 +283,7 @@ func TestRejectionLogBare(t *testing.T) {
 		bare := NewHandlers(store, nil, nil)
 		bareMux := http.NewServeMux()
 		bare.Register(bareMux)
-		rec := postJSON(bareMux, "/peers", "{")
+		rec := postMux(bareMux, "/peers", "{")
 		requirePhrase(t, rec, http.StatusBadRequest, "invalid json")
 	})
 }
@@ -311,7 +311,7 @@ func TestKeyAllowanceHTTP(t *testing.T) {
 	rec = getReq(mux, "/peers/other-key", "")
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
 
-	rec = postJSON(mux, "/peers", peerJSON("bob", "127.0.0.1:1", "available"))
+	rec = postMux(mux, "/peers", peerJSON("bob", "127.0.0.1:1", "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register bob %d %s", rec.Code, rec.Body.String())
 	}
@@ -319,7 +319,7 @@ func TestKeyAllowanceHTTP(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("lookup bob %d", rec.Code)
 	}
-	rec = postJSON(mux, "/connect", connectJSON("alice", "bob", "127.0.0.1:2"))
+	rec = postMux(mux, "/connect", connectJSON("alice", "bob", "127.0.0.1:2"))
 	requirePhrase(t, rec, http.StatusTooManyRequests, "too many requests")
 	if len(h.byID) != 0 {
 		t.Fatal("exhausted connect created a request")
@@ -336,7 +336,7 @@ func TestKeyAllowanceHTTP(t *testing.T) {
 	}
 
 	for i := range 3 {
-		rec = postJSON(mux, "/peers", peerJSON("reg-key", "127.0.0.1:3", "available"))
+		rec = postMux(mux, "/peers", peerJSON("reg-key", "127.0.0.1:3", "available"))
 		if i < 2 && rec.Code != http.StatusOK {
 			t.Fatalf("register %d: %d %s", i, rec.Code, rec.Body.String())
 		}
@@ -424,7 +424,7 @@ func connectJSON(fromKey, toKey, fromAddress string) string {
 	return string(b)
 }
 
-func postJSON(mux *http.ServeMux, target, body string) *httptest.ResponseRecorder {
+func postMux(mux *http.ServeMux, target, body string) *httptest.ResponseRecorder {
 	return callMux(mux, http.MethodPost, target, body, "")
 }
 
