@@ -99,7 +99,9 @@ func main() {
 
 		if chatting && conn != nil {
 			if line == "/quit" {
-				conn.Close(websocket.StatusNormalClosure, "bye")
+				if err := conn.Close(websocket.StatusNormalClosure, "bye"); err != nil {
+					a.logger.Warn("close chat", "err", err)
+				}
 				a.mu.Lock()
 				a.inChat = false
 				a.chatConn = nil
@@ -163,6 +165,18 @@ func main() {
 	}
 }
 
+func (a *app) drain(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		a.logger.Warn("drain response", "err", err)
+	}
+	if err := body.Close(); err != nil {
+		a.logger.Warn("close response", "err", err)
+	}
+}
+
 func (a *app) register(state string) error {
 	body, _ := json.Marshal(map[string]string{
 		"key": a.myKey, "address": a.listenAddr, "state": state,
@@ -171,8 +185,7 @@ func (a *app) register(state string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	a.drain(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -184,7 +197,7 @@ func (a *app) lookup(key string) (*peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer a.drain(resp.Body)
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("not found")
 	}
@@ -212,8 +225,12 @@ func (a *app) pollPending() {
 				continue
 			}
 			var reqs []map[string]any
-			json.NewDecoder(resp.Body).Decode(&reqs)
-			resp.Body.Close()
+			err = json.NewDecoder(resp.Body).Decode(&reqs)
+			a.drain(resp.Body)
+			if err != nil {
+				a.logger.Warn("decode pending", "err", err)
+				continue
+			}
 			for _, r := range reqs {
 				id, _ := r["request_id"].(string)
 				from, _ := r["from_key"].(string)
@@ -232,8 +249,7 @@ func (a *app) postAction(id, action string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
+	a.drain(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -256,7 +272,7 @@ func (a *app) doConnect(target string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer a.drain(resp.Body)
 	var cr connectResp
 	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
 		return err
@@ -270,8 +286,12 @@ func (a *app) doConnect(target string) error {
 			continue
 		}
 		var status map[string]any
-		json.NewDecoder(resp.Body).Decode(&status)
-		resp.Body.Close()
+		err = json.NewDecoder(resp.Body).Decode(&status)
+		a.drain(resp.Body)
+		if err != nil {
+			a.logger.Warn("decode request status", "err", err)
+			continue
+		}
 		st, _ := status["status"].(string)
 		if st == "accepted" {
 			fmt.Println("accepted — dialing", p.Address)
@@ -297,7 +317,9 @@ func (a *app) serveWS() {
 	srv := &http.Server{Addr: a.listenAddr, Handler: mux}
 	go func() {
 		<-a.ctx.Done()
-		srv.Shutdown(context.Background())
+		if err := srv.Shutdown(context.Background()); err != nil {
+			a.logger.Error("ws shutdown", "err", err)
+		}
 	}()
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		a.logger.Error("ws listen failed", "err", err)
@@ -322,7 +344,9 @@ func (a *app) enterChat(c *websocket.Conn) {
 
 	go func() {
 		defer func() {
-			c.Close(websocket.StatusNormalClosure, "")
+			if err := c.Close(websocket.StatusNormalClosure, ""); err != nil {
+				a.logger.Warn("close chat", "err", err)
+			}
 			a.mu.Lock()
 			if a.chatConn == c {
 				a.inChat = false

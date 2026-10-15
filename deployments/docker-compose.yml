@@ -1,0 +1,42 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  vault:
+    image: hashicorp/vault:1.17
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add:
+      - IPC_LOCK
+    command: server -dev
+
+  connector:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.connector
+    ports:
+      - "8080:8080"
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    volumes:
+      - connector-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      vault:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  connector-data:

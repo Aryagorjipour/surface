@@ -50,6 +50,17 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.Handle("GET /requests/{id}", otelhttp.NewHandler(http.HandlerFunc(h.handleRequestStatus), "GET /requests/{id}"))
 }
 
+func (h *Handlers) writeJSON(w http.ResponseWriter, status int, v any) {
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h.logger.Error("encode response", "err", err)
+	}
+}
+
 type peerRequest struct {
 	Key     string `json:"key"`
 	Address string `json:"address"`
@@ -84,8 +95,7 @@ func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = h.cache.DelPeer(r.Context(), req.Key)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	h.writeJSON(w, 0, map[string]bool{"ok": true})
 }
 
 func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
@@ -97,8 +107,7 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 
 	if h.cache != nil {
 		if p, err := h.cache.GetPeer(r.Context(), key); err == nil {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(p)
+			h.writeJSON(w, 0, p)
 			return
 		}
 	}
@@ -116,8 +125,7 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 
 	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state}, 30*time.Second)
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peerResponse{Key: key, Address: addr, State: state})
+	h.writeJSON(w, 0, peerResponse{Key: key, Address: addr, State: state})
 }
 
 func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -157,9 +165,7 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 	h.byToKey[req.ToKey] = append(h.byToKey[req.ToKey], cr.ID)
 	h.mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{
+	h.writeJSON(w, http.StatusCreated, map[string]string{
 		"request_id": cr.ID,
 		"status":     cr.Status,
 	})
@@ -182,8 +188,7 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(out)
+	h.writeJSON(w, 0, out)
 }
 
 func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
@@ -201,8 +206,7 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 
 	_ = h.cache.UpdateRequestStatus(r.Context(), id, "accepted")
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "accepted"})
+	h.writeJSON(w, 0, map[string]string{"status": "accepted"})
 }
 
 func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
@@ -221,8 +225,7 @@ func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 	_ = h.cache.UpdateRequestStatus(r.Context(), id, "rejected")
 
 	h.logger.Info("request rejected", "id", id)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "rejected"})
+	h.writeJSON(w, 0, map[string]string{"status": "rejected"})
 }
 
 func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
@@ -236,6 +239,5 @@ func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(cr)
+	h.writeJSON(w, 0, cr)
 }

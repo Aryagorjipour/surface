@@ -4,7 +4,7 @@ import "testing"
 
 func TestRequireString(t *testing.T) {
 	data := map[string]interface{}{
-		"ok": "value",
+		"ok":    "value",
 		"empty": "",
 	}
 

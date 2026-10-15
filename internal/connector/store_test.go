@@ -23,8 +23,16 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer store.Close()
-	defer os.Remove(dbPath)
+	defer func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer func() {
+		if err := os.Remove(dbPath); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	err = store.UpsertPeer(ctx, "alice", "192.168.1.10:8765", "available")
 	if err != nil {
