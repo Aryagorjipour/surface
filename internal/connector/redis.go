@@ -40,19 +40,27 @@ func (r *RedisCache) Close() error {
 	return r.client.Close()
 }
 
+// cachedPeer is the Redis value for a peer. last_seen stays out of the HTTP body.
+type cachedPeer struct {
+	Key      string `json:"key"`
+	Address  string `json:"address"`
+	State    string `json:"state"`
+	LastSeen int64  `json:"last_seen"`
+}
+
 // Peer cache
-func (r *RedisCache) SetPeer(ctx context.Context, key string, p peerResponse, ttl time.Duration) error {
+func (r *RedisCache) SetPeer(ctx context.Context, key string, p peerResponse, lastSeen int64, ttl time.Duration) error {
 	if r == nil {
 		return nil
 	}
-	b, err := json.Marshal(p)
+	b, err := json.Marshal(cachedPeer{Key: p.Key, Address: p.Address, State: p.State, LastSeen: lastSeen})
 	if err != nil {
 		return err
 	}
 	return r.client.Set(ctx, "peer:"+key, b, ttl).Err()
 }
 
-func (r *RedisCache) GetPeer(ctx context.Context, key string) (*peerResponse, error) {
+func (r *RedisCache) GetPeer(ctx context.Context, key string) (*cachedPeer, error) {
 	if r == nil {
 		return nil, redis.Nil
 	}
@@ -60,7 +68,7 @@ func (r *RedisCache) GetPeer(ctx context.Context, key string) (*peerResponse, er
 	if err != nil {
 		return nil, err
 	}
-	var p peerResponse
+	var p cachedPeer
 	if err := json.Unmarshal(b, &p); err != nil {
 		return nil, err
 	}
@@ -106,7 +114,7 @@ func (r *RedisCache) GetRequest(ctx context.Context, id string) (*ConnectRequest
 	return &cr, nil
 }
 
-func (r *RedisCache) UpdateRequestStatus(ctx context.Context, id, status string) error {
+func (r *RedisCache) UpdateRequestStatus(ctx context.Context, id, status string, ttl time.Duration) error {
 	if r == nil {
 		return nil
 	}
@@ -116,12 +124,35 @@ func (r *RedisCache) UpdateRequestStatus(ctx context.Context, id, status string)
 	}
 	cr.Status = status
 	b, _ := json.Marshal(cr)
-	return r.client.Set(ctx, "req:"+id, b, 10*time.Minute).Err()
+	return r.client.Set(ctx, "req:"+id, b, ttl).Err()
 }
 
+// PendingIDs returns ids whose req key still exists and removes the rest from the set.
 func (r *RedisCache) PendingIDs(ctx context.Context, toKey string) ([]string, error) {
 	if r == nil {
 		return nil, nil
 	}
-	return r.client.SMembers(ctx, "pending:"+toKey).Result()
+	ids, err := r.client.SMembers(ctx, "pending:"+toKey).Result()
+	if err != nil || len(ids) == 0 {
+		return ids, err
+	}
+	kept := make([]string, 0, len(ids))
+	var gone []any
+	for _, id := range ids {
+		n, err := r.client.Exists(ctx, "req:"+id).Result()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			gone = append(gone, id)
+			continue
+		}
+		kept = append(kept, id)
+	}
+	if len(gone) > 0 {
+		if err := r.client.SRem(ctx, "pending:"+toKey, gone...).Err(); err != nil {
+			return nil, err
+		}
+	}
+	return kept, nil
 }

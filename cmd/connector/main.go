@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,11 +15,24 @@ import (
 
 func main() {
 	logger := shared.NewLogger("connector")
-	cfg, err := connector.ParseLimitConfig(os.LookupEnv)
-	if err != nil {
+	if err := run(os.LookupEnv, logger, func(srv *http.Server) error {
+		return srv.ListenAndServe()
+	}); err != nil {
 		logger.Error("refused startup", "err", err)
 		os.Exit(1)
 	}
+}
+
+func run(lookup func(string) (string, bool), logger *slog.Logger, listen func(*http.Server) error) error {
+	cfg, err := connector.ParseLimitConfig(lookup)
+	if err != nil {
+		return err
+	}
+	expiry, err := connector.ParseExpiryConfig(lookup)
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -43,28 +57,18 @@ func main() {
 		logger.Error("failed to open store", "err", err)
 		os.Exit(1)
 	}
-	defer func() {
-		if err := store.Close(); err != nil {
-			logger.Error("store close", "err", err)
-		}
-	}()
 
 	var cache *connector.RedisCache
 	if secrets.RedisAddr != "" && secrets.RedisAddr != "redis:6379" {
 		cache = connector.NewRedis(secrets.RedisAddr, secrets.RedisPassword)
-		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
 		err := cache.Ping(pingCtx)
-		cancel()
+		pingCancel()
 		if err != nil {
 			logger.Warn("redis unavailable, continuing without cache", "err", err)
 			cache = nil
 		} else {
 			logger.Info("redis connected")
-			defer func() {
-				if err := cache.Close(); err != nil {
-					logger.Error("redis close", "err", err)
-				}
-			}()
 		}
 	} else {
 		logger.Info("redis disabled")
@@ -72,6 +76,18 @@ func main() {
 
 	h := connector.NewHandlers(store, cache, logger)
 	h.SetLimits(connector.NewLimits(cfg))
+	h.SetLifetime(expiry.RequestLifetime)
+	h.SetSilenceWindow(expiry.SilenceWindow)
+	keys, err := store.Prune(ctx, time.Now(), expiry.SilenceWindow)
+	if err != nil {
+		logger.Error("prune failed", "err", err)
+	} else {
+		dropPrunedPeerCache(ctx, cache, logger, keys)
+	}
+
+	pruneCtx, pruneCancel := context.WithCancel(context.Background())
+	waitPrune := h.StartPrune(pruneCtx, time.Second)
+
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -85,7 +101,7 @@ func main() {
 
 	go func() {
 		logger.Info("connector listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := listen(srv); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "err", err)
 			os.Exit(1)
 		}
@@ -95,10 +111,33 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
+	pruneCancel()
+	waitPrune()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown error", "err", err)
 	}
+	if cache != nil {
+		if err := cache.Close(); err != nil {
+			logger.Error("redis close", "err", err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		logger.Error("store close", "err", err)
+	}
 	logger.Info("connector stopped")
+	return nil
+}
+
+// dropPrunedPeerCache removes the Redis copy of every peer row the pre-listen prune deleted.
+// The log is the operation and the count. A pass that removes nothing logs nothing.
+func dropPrunedPeerCache(ctx context.Context, cache *connector.RedisCache, logger *slog.Logger, keys []string) {
+	for _, key := range keys {
+		_ = cache.DelPeer(ctx, key)
+	}
+	if len(keys) > 0 && logger != nil {
+		logger.Info("pruned peers", "count", len(keys))
+	}
 }

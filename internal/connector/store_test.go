@@ -63,6 +63,61 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPruneDropsStalePeers(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
+	now := t0
+	store.SetNow(func() time.Time { return now })
+
+	if err := store.UpsertPeer(ctx, "old-peer", "203.0.113.8:8", "available"); err != nil {
+		t.Fatal(err)
+	}
+	now = t0.Add(5 * time.Second)
+	if err := store.UpsertPeer(ctx, "fresh-peer", "203.0.113.9:9", "busy"); err != nil {
+		t.Fatal(err)
+	}
+	window := 7 * time.Second
+	now = t0.Add(8 * time.Second)
+	keys, err := store.Prune(ctx, now, window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || keys[0] != "old-peer" {
+		t.Fatalf("pruned %#v", keys)
+	}
+	addr, _, _, err := store.GetPeer(ctx, "old-peer")
+	if err == nil || err.Error() != "peer not found" || addr != "" {
+		t.Fatalf("stale get addr=%q err=%v", addr, err)
+	}
+	addr, state, _, err := store.GetPeer(ctx, "fresh-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "203.0.113.9:9" || state != "busy" {
+		t.Fatalf("fresh peer %s %s", addr, state)
+	}
+
+	if _, err := store.Prune(ctx, now, 24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := store.GetPeer(ctx, "old-peer"); err == nil || err.Error() != "peer not found" {
+		t.Fatalf("24h prune restored the row: %v", err)
+	}
+
+	now = t0.Add(9 * time.Second)
+	if err := store.UpsertPeer(ctx, "old-peer", "203.0.113.10:10", "available"); err != nil {
+		t.Fatal(err)
+	}
+	addr, state, _, err = store.GetPeer(ctx, "old-peer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr != "203.0.113.10:10" || state != "available" {
+		t.Fatalf("re-register %s %s", addr, state)
+	}
+}
+
 func TestEncryptDecrypt(t *testing.T) {
 	key := make([]byte, 32)
 	ct, nonce, err := encrypt(key, "secret-address")

@@ -213,6 +213,131 @@ func TestE2E(t *testing.T) {
 	}
 }
 
+func TestOpenChatSurvivesExpiry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), e2eBudget)
+	defer cancel()
+
+	store := testStore(t)
+	logger := slog.New(slog.DiscardHandler)
+	h := NewHandlers(store, nil, logger)
+	mux := http.NewServeMux()
+	h.Register(mux)
+	connector := httptest.NewServer(mux)
+	t.Cleanup(connector.Close)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		failE2E(t, "start", err)
+	}
+	calleeAddr := ln.Addr().String()
+	const payload = "surface-e2e-open"
+
+	payloadCh := make(chan []byte, 1)
+	wsErr := make(chan error, 1)
+	wsMux := http.NewServeMux()
+	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			sendErr(wsErr, err)
+			return
+		}
+		typ, data, err := c.Read(ctx)
+		if err != nil {
+			sendErr(wsErr, err)
+			_ = c.Close(websocket.StatusNormalClosure, "")
+			return
+		}
+		if typ != websocket.MessageText {
+			sendErr(wsErr, errors.New("frame type"))
+			_ = c.Close(websocket.StatusNormalClosure, "")
+			return
+		}
+		payloadCh <- append([]byte(nil), data...)
+		_, _, readErr := c.Read(ctx)
+		_ = c.Close(websocket.StatusNormalClosure, "")
+		if websocket.CloseStatus(readErr) != websocket.StatusNormalClosure && readErr != nil && !errors.Is(readErr, net.ErrClosed) {
+			sendErr(wsErr, readErr)
+		}
+	})
+	wsSrv := &http.Server{Handler: wsMux}
+	go func() {
+		err := wsSrv.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			sendErr(wsErr, err)
+		}
+	}()
+	t.Cleanup(func() {
+		shut, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = wsSrv.Shutdown(shut)
+	})
+
+	base := connector.URL
+	step := func(name string, err error) {
+		t.Helper()
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
+			failE2E(t, name, err, calleeAddr)
+		}
+	}
+	step("start", nil)
+
+	var registered struct {
+		OK bool `json:"ok"`
+	}
+	step("register", postJSON(ctx, base+"/peers", map[string]string{
+		"key": "e2e-callee-open", "address": calleeAddr, "state": "available",
+	}, http.StatusOK, &registered))
+	step("register", postJSON(ctx, base+"/peers", map[string]string{
+		"key": "e2e-caller-open", "address": e2eCallerAddr, "state": "available",
+	}, http.StatusOK, &registered))
+
+	var looked struct {
+		Address string `json:"address"`
+	}
+	step("connect", getJSON(ctx, base+"/peers/e2e-callee-open", http.StatusOK, &looked))
+	if looked.Address != calleeAddr {
+		failE2E(t, "connect", errors.New("address mismatch"), calleeAddr)
+	}
+	var created struct {
+		ID     string `json:"request_id"`
+		Status string `json:"status"`
+	}
+	step("connect", postJSON(ctx, base+"/connect", map[string]string{
+		"from_key": "e2e-caller-open", "to_key": "e2e-callee-open", "from_address": e2eCallerAddr,
+	}, http.StatusCreated, &created))
+	var acceptBody struct {
+		Status string `json:"status"`
+	}
+	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptBody))
+	if acceptBody.Status != "accepted" {
+		failE2E(t, "accept", errors.New("status"))
+	}
+
+	conn, _, err := websocket.Dial(ctx, "ws://"+looked.Address, nil)
+	step("exchange", err)
+	h.SetNow(func() time.Time { return time.Now().Add(25 * time.Hour) })
+	step("exchange", conn.Write(ctx, websocket.MessageText, []byte(payload)))
+
+	var got []byte
+	select {
+	case got = <-payloadCh:
+	case err := <-wsErr:
+		step("exchange", err)
+	case <-ctx.Done():
+		step("exchange", ctx.Err())
+	}
+	if !bytes.Equal(got, []byte(payload)) {
+		failE2E(t, "exchange", errors.New("payload mismatch"))
+	}
+	err = conn.Close(websocket.StatusNormalClosure, "")
+	if err != nil && !errors.Is(err, net.ErrClosed) && websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+		step("close", err)
+	}
+}
+
 func postJSON(ctx context.Context, url string, in any, want int, out any) error {
 	return doJSON(ctx, http.MethodPost, url, in, want, out)
 }
