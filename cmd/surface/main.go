@@ -47,7 +47,7 @@ type app struct {
 	mu          sync.Mutex
 	presence    string
 	inChat      bool
-	chatConn    *websocket.Conn
+	chatConn    byteConn
 	sess        *session.Session
 	dialer      bool
 	peerAddr    string
@@ -56,6 +56,9 @@ type app struct {
 	queued      []string
 	fromKey     map[string]string
 	gate        Gate
+	punchAddr   string
+	relayAddr   string
+	out         io.Writer
 }
 
 func main() {
@@ -89,6 +92,17 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	endpoint, _ := lookup("OTEL_EXPORTER_OTLP_ENDPOINT")
+	shutdown, traceErr := shared.InitOTEL(ctx, "surface", logger, endpoint)
+	if traceErr != nil {
+		logger.Warn("otel init failed, continuing without traces", "err", traceErr)
+	} else {
+		defer func() {
+			if err := shutdown(context.Background()); err != nil {
+				logger.Warn("otel shutdown", "err", err)
+			}
+		}()
+	}
 	a := &app{
 		base:         strings.TrimRight(cfg.rest[0], "/"),
 		myKey:        cfg.rest[1],
@@ -102,6 +116,8 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		cancel:       cancel,
 		presence:     "available",
 		fromKey:      map[string]string{},
+		punchAddr:    cfg.punch,
+		relayAddr:    cfg.relay,
 	}
 	a.gate.readable = a.requestReadable
 	go a.serveWS()
@@ -199,11 +215,10 @@ func (a *app) handleLine(line string) error {
 			fmt.Println("accept error:", err)
 			return nil
 		}
-		a.mu.Lock()
-		from := a.fromKey[parts[1]]
-		a.mu.Unlock()
+		from := a.callerFor(parts[1])
 		a.gate.remember(parts[1], from, a.myKey, raw)
-		fmt.Println("accepted — waiting for peer to dial")
+		a.say("accepted — waiting for peer to dial")
+		go a.attempt(false, "", parts[1], from, a.myKey, raw)
 	case "reject":
 		if len(parts) < 2 {
 			fmt.Println("usage: reject <request-id>")
@@ -212,7 +227,7 @@ func (a *app) handleLine(line string) error {
 		if _, err := a.postAction(parts[1], "reject"); err != nil {
 			fmt.Println("reject error:", err)
 		} else {
-			fmt.Println("rejected")
+			a.say("rejected")
 		}
 	default:
 		fmt.Println("unknown command")
@@ -412,7 +427,7 @@ func (a *app) doConnect(target string) error {
 	fmt.Println("request created:", cr.RequestID)
 
 	for i := 0; i < 30; i++ {
-		time.Sleep(time.Second)
+		time.Sleep(acceptPoll)
 		resp, err := a.do(http.MethodGet, a.base+"/requests/"+cr.RequestID, nil)
 		if err != nil {
 			continue
@@ -434,8 +449,8 @@ func (a *app) doConnect(target string) error {
 			if err != nil {
 				return err
 			}
-			fmt.Println("accepted — dialing", p.Address)
-			return a.dialAndChat(p.Address, cr.RequestID, target, raw)
+			a.say("accepted — dialing", p.Address)
+			return a.attempt(true, p.Address, cr.RequestID, a.myKey, target, raw)
 		}
 		if status.Status == "rejected" {
 			return fmt.Errorf("rejected")
@@ -465,7 +480,7 @@ func (a *app) serveWS() {
 	}
 }
 
-func (a *app) onIncoming(c *websocket.Conn) {
+func (a *app) onIncoming(c byteConn) {
 	a.mu.Lock()
 	if a.chatConn != nil {
 		a.mu.Unlock()
@@ -477,8 +492,9 @@ func (a *app) onIncoming(c *websocket.Conn) {
 	var admitted bool
 	ready := func(sess *session.Session) {
 		admitted = true
-		fmt.Println("\n" + connectedPrompt(false))
-		a.beginChat(c, sess, false, "")
+		if a.beginChat(c, sess, false, "") {
+			a.say("\n" + connectedPrompt(false))
+		}
 	}
 	sess, err := a.gate.take(a.ctx, c, time.Now(), until, ready)
 	if err != nil || admitted || sess == nil {
@@ -487,23 +503,44 @@ func (a *app) onIncoming(c *websocket.Conn) {
 	a.resumeAttached(c, sess)
 }
 
-func (a *app) dialAndChat(addr, requestID, target string, proof []byte) error {
-	c, _, err := websocket.Dial(a.ctx, "ws://"+addr, nil)
-	if err != nil {
-		return err
+func (a *app) say(args ...any) {
+	if a == nil || a.out == nil {
+		fmt.Println(args...)
+		return
 	}
-	sess, err := a.gate.dialAdmitted(a.ctx, c, requestID, a.myKey, target, proof)
-	if err != nil {
-		_ = c.Close(websocket.StatusPolicyViolation, "")
-		return err
-	}
-	fmt.Println(connectedPrompt(true))
-	a.beginChat(c, sess, true, addr)
-	return nil
+	fmt.Fprintln(a.out, args...)
 }
 
-func (a *app) beginChat(c *websocket.Conn, sess *session.Session, dialer bool, addr string) {
+func (a *app) callerFor(id string) string {
 	a.mu.Lock()
+	from := a.fromKey[id]
+	a.mu.Unlock()
+	if from != "" {
+		return from
+	}
+	resp, err := a.do(http.MethodGet, a.base+"/requests/"+id, nil)
+	if err != nil {
+		return ""
+	}
+	defer a.drain(resp.Body)
+	var body struct {
+		From string `json:"from_key"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return ""
+	}
+	a.mu.Lock()
+	a.fromKey[id] = body.From
+	a.mu.Unlock()
+	return body.From
+}
+
+func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr string) bool {
+	a.mu.Lock()
+	if a.inChat {
+		a.mu.Unlock()
+		return false
+	}
 	a.inChat = true
 	a.chatConn = c
 	a.sess = sess
@@ -513,9 +550,10 @@ func (a *app) beginChat(c *websocket.Conn, sess *session.Session, dialer bool, a
 	a.resumeUntil = time.Time{}
 	a.mu.Unlock()
 	go a.chatLoop(c)
+	return true
 }
 
-func (a *app) resumeAttached(c *websocket.Conn, sess *session.Session) {
+func (a *app) resumeAttached(c byteConn, sess *session.Session) {
 	a.mu.Lock()
 	a.inChat = true
 	a.chatConn = c
@@ -525,7 +563,7 @@ func (a *app) resumeAttached(c *websocket.Conn, sess *session.Session) {
 	go a.chatLoop(c)
 }
 
-func (a *app) chatLoop(c *websocket.Conn) {
+func (a *app) chatLoop(c byteConn) {
 	for {
 		if !a.readLoop(c) {
 			return
@@ -547,7 +585,7 @@ func (a *app) chatLoop(c *websocket.Conn) {
 	}
 }
 
-func (a *app) readLoop(c *websocket.Conn) bool {
+func (a *app) readLoop(c byteConn) bool {
 	for {
 		_, data, err := c.Read(a.ctx)
 		if err != nil {
@@ -580,7 +618,7 @@ func (a *app) readLoop(c *websocket.Conn) bool {
 	}
 }
 
-func (a *app) tellFinished(c *websocket.Conn, sess *session.Session) {
+func (a *app) tellFinished(c byteConn, sess *session.Session) {
 	if frame := session.FailureNotice(sess); len(frame) > 0 && c != nil {
 		_ = c.Write(a.ctx, websocket.MessageBinary, frame)
 	}
@@ -618,7 +656,7 @@ func (a *app) endSession(quit bool) {
 	}
 }
 
-func (a *app) armBreak(c *websocket.Conn) bool {
+func (a *app) armBreak(c byteConn) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.quitting {
@@ -659,7 +697,7 @@ func (a *app) watchResume(until time.Time) {
 	}
 }
 
-func (a *app) retryDial(addr string) (*websocket.Conn, bool) {
+func (a *app) retryDial(addr string) (byteConn, bool) {
 	for {
 		a.mu.Lock()
 		until := a.resumeUntil

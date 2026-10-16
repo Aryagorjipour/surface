@@ -1,19 +1,34 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Aryagorjipour/surface/internal/connector"
 	"github.com/Aryagorjipour/surface/internal/shared"
 )
+
+// installTracer starts the shared exporter. Setup failure is logged and the
+// process still serves. A nil shutdown means nothing was installed.
+func installTracer(ctx context.Context, logger *slog.Logger, endpoint string) func(context.Context) error {
+	shutdown, err := shared.InitOTEL(ctx, "connector", logger, endpoint)
+	if err != nil {
+		logger.Warn("otel init failed, continuing without traces", "err", err)
+		return nil
+	}
+	return shutdown
+}
 
 func main() {
 	logger := shared.NewLogger("connector")
@@ -36,14 +51,14 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	if err != nil {
 		return err
 	}
+	if op.Ready {
+		return probeReady()
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	shutdown, err := connector.InitOTEL(ctx, "connector", logger, op.TraceEndpoint)
-	if err != nil {
-		logger.Warn("otel init failed, continuing without traces", "err", err)
-	} else {
+	if shutdown := installTracer(ctx, logger, op.TraceEndpoint); shutdown != nil {
 		defer func() {
 			if err := shutdown(context.Background()); err != nil {
 				logger.Warn("otel shutdown", "err", err)
@@ -108,6 +123,13 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 
 	mux := http.NewServeMux()
 	h.Register(mux)
+	if strings.TrimSpace(op.Punch) != "" {
+		go func() {
+			if err := listenPunch(ctx, op.Punch, h); err != nil && ctx.Err() == nil {
+				logger.Error("punch listen", "err", err)
+			}
+		}()
+	}
 
 	srv := &http.Server{
 		Addr:         op.Listen,
@@ -147,6 +169,53 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	}
 	logger.Info("connector stopped")
 	return nil
+}
+
+// probeReady is a client. It does not load secrets and does not listen.
+func probeReady() error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:8080/health")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32))
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode == http.StatusOK && bytes.HasPrefix(body, []byte("ok")) {
+		return nil
+	}
+	return fmt.Errorf("not ready")
+}
+
+// listenPunch reads UDP tickets. Only a 16-byte payload is recorded. The source is not logged.
+func listenPunch(ctx context.Context, addr string, h *connector.Handlers) error {
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return err
+	}
+	defer pc.Close()
+	go func() {
+		<-ctx.Done()
+		_ = pc.Close()
+	}()
+	buf := make([]byte, 64*1024)
+	for {
+		n, src, err := pc.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if n != 16 || src == nil {
+			continue
+		}
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		h.NotePunch(pkt, src.String())
+	}
 }
 
 // dropPrunedPeerCache removes the Redis copy of every peer row the pre-listen prune deleted.

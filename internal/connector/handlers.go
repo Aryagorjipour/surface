@@ -15,7 +15,8 @@ import (
 
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/google/uuid"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type ConnectRequest struct {
@@ -42,6 +43,8 @@ type Handlers struct {
 	lifetime   time.Duration
 	silence    time.Duration
 	bearer     string
+	punchMu    sync.Mutex
+	punch      *punchBook
 }
 
 func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
@@ -130,20 +133,72 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	h.route(mux, "POST /requests/{id}/accept", "accept", h.handleAccept)
 	h.route(mux, "POST /requests/{id}/reject", "reject", h.handleReject)
 	h.route(mux, "GET /requests/{id}", "status", h.handleRequestStatus)
+	h.route(mux, "POST /requests/{id}/punch", "punch", h.handlePunch)
+	mux.HandleFunc("GET /health", h.handleHealth)
+	// An extra path still uses this handler, so the span stays GET /health.
+	mux.HandleFunc("GET /health/", h.handleHealth)
 }
 
 func (h *Handlers) route(mux *http.ServeMux, pattern, op string, fn http.HandlerFunc) {
-	traced := otelhttp.NewHandler(fn, pattern)
 	mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-		if !h.lim().AllowSource(SourceHost(r.RemoteAddr)) {
-			h.reject(w, http.StatusTooManyRequests, op, "too many requests")
-			return
-		}
-		if !bearerOK(h.bearer, r.Header.Get("Authorization")) {
-			h.reject(w, http.StatusUnauthorized, op, "unauthorized")
-			return
-		}
-		traced.ServeHTTP(w, ScrubForTrace(r, pattern))
+		h.withSpan(pattern, w, r, func(w http.ResponseWriter, r *http.Request) {
+			if !h.lim().AllowSource(SourceHost(r.RemoteAddr)) {
+				h.reject(w, http.StatusTooManyRequests, op, "too many requests")
+				return
+			}
+			if !bearerOK(h.bearer, r.Header.Get("Authorization")) {
+				h.reject(w, http.StatusUnauthorized, op, "unauthorized")
+				return
+			}
+			fn(w, r)
+		})
+	})
+}
+
+// withSpan records one span named with the route template. The only attributes
+// are endpoint and the HTTP status written to the client.
+func (h *Handlers) withSpan(pattern string, w http.ResponseWriter, r *http.Request, fn func(http.ResponseWriter, *http.Request)) {
+	ctx, span := otel.Tracer("github.com/Aryagorjipour/surface/connector").Start(r.Context(), pattern)
+	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+	defer func() {
+		span.SetAttributes(
+			attribute.String("endpoint", pattern),
+			attribute.Int("status", sw.status),
+		)
+		span.End()
+	}()
+	fn(sw, r.WithContext(ctx))
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if !s.wrote {
+		s.status = code
+		s.wrote = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.status = http.StatusOK
+		s.wrote = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// handleHealth is outside the bearer check and the source allowance.
+// The body is the word ok and a newline. It does not register a peer.
+func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
+	h.withSpan("GET /health", w, r, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
 	})
 }
 
@@ -492,6 +547,7 @@ type droppedRequest struct {
 func (h *Handlers) removeLocked(id string) (droppedRequest, bool) {
 	cr := h.byID[id]
 	delete(h.byID, id)
+	h.clearPunch(id)
 	if cr == nil {
 		return droppedRequest{}, false
 	}

@@ -130,3 +130,66 @@ func TestOperatorPrecedence(t *testing.T) {
 		t.Fatalf("empty cache %+v", emptyCache)
 	}
 }
+
+func TestPunchFlag(t *testing.T) {
+	def, err := ParseOperator(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.Punch != "127.0.0.1:8081" || def.PunchSet {
+		t.Fatalf("default punch %+v", def.Punch)
+	}
+	if !strings.Contains(ConnectorHelp(), "--punch") {
+		t.Fatal(ConnectorHelp())
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "punch.env")
+	if err := os.WriteFile(path, []byte("SURFACE_PUNCH_ADDR=127.0.0.1:7001\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := ParseOperator([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil || fromFile.Punch != "127.0.0.1:7001" || !fromFile.PunchSet {
+		t.Fatalf("file %+v %v", fromFile.Punch, err)
+	}
+	fromEnv, err := ParseOperator([]string{"--config", path}, func(k string) (string, bool) {
+		if k == "SURFACE_PUNCH_ADDR" {
+			return "127.0.0.1:7002", true
+		}
+		return "", false
+	})
+	if err != nil || fromEnv.Punch != "127.0.0.1:7002" {
+		t.Fatalf("env %+v %v", fromEnv.Punch, err)
+	}
+	fromFlag, err := ParseOperator([]string{"--config", path, "--punch", "127.0.0.1:7003"}, func(k string) (string, bool) {
+		if k == "SURFACE_PUNCH_ADDR" {
+			return "127.0.0.1:7002", true
+		}
+		return "", false
+	})
+	if err != nil || fromFlag.Punch != "127.0.0.1:7003" {
+		t.Fatalf("flag %+v %v", fromFlag.Punch, err)
+	}
+
+	disabled, err := ParseOperator([]string{"--punch", "  "}, nil)
+	if err != nil || disabled.Punch != "" || !disabled.PunchSet {
+		t.Fatalf("flag empty %+v %v", disabled, err)
+	}
+	envEmpty, err := ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_PUNCH_ADDR" {
+			return " \t ", true
+		}
+		return "", false
+	})
+	if err != nil || envEmpty.Punch != "" {
+		t.Fatalf("env empty %+v %v", envEmpty.Punch, err)
+	}
+	blank := filepath.Join(dir, "blank.env")
+	if err := os.WriteFile(blank, []byte("SURFACE_PUNCH_ADDR=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileEmpty, err := ParseOperator([]string{"--config", blank}, func(string) (string, bool) { return "", false })
+	if err != nil || fileEmpty.Punch != "" {
+		t.Fatalf("file empty %+v %v", fileEmpty.Punch, err)
+	}
+}

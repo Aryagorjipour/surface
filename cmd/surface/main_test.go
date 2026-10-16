@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -254,5 +256,71 @@ func TestRequestReadableFollowsStatus(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), proof) {
 		t.Fatalf("log contains proof: %s", buf.String())
+	}
+}
+
+func TestSurfacePathFlags(t *testing.T) {
+	help := surfaceHelp()
+	if !strings.Contains(help, "--relay") || !strings.Contains(help, "--punch") {
+		t.Fatalf("help\n%s", help)
+	}
+	def, err := parseSurface([]string{"http://connector.example:8080", "alice"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.relay != "" || def.punch != "connector.example:8081" {
+		t.Fatalf("defaults relay %q punch %q", def.relay, def.punch)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "surface.env")
+	if err := os.WriteFile(path, []byte("SURFACE_RELAY=file-relay:1\nSURFACE_PUNCH=10.1.1.1:8081\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(k string) (string, bool) {
+		switch k {
+		case "SURFACE_RELAY":
+			return "env-relay:1", true
+		case "SURFACE_PUNCH":
+			return "10.2.2.2:9", true
+		default:
+			return "", false
+		}
+	}
+	fromEnv, err := parseSurface([]string{"--config", path, "http://127.0.0.1:8080", "alice"}, lookup)
+	if err != nil || fromEnv.relay != "env-relay:1" || fromEnv.punch != "10.2.2.2:9" {
+		t.Fatalf("env %+v %v", fromEnv, err)
+	}
+	fromFlag, err := parseSurface([]string{"--config", path, "--relay", "flag-relay:1", "--punch", "10.3.3.3:9", "http://127.0.0.1:8080", "alice"}, lookup)
+	if err != nil || fromFlag.relay != "flag-relay:1" || fromFlag.punch != "10.3.3.3:9" {
+		t.Fatalf("flag %+v %v", fromFlag, err)
+	}
+	blank, err := parseSurface([]string{"--relay", " \t ", "--punch", "  ", "http://connector.example:8080", "alice"}, nil)
+	if err != nil || blank.relay != "" || blank.punch != "" {
+		t.Fatalf("blank %+v %v", blank, err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var runErr error
+	text := captureStdout(t, func() {
+		runErr = run([]string{srv.URL, "alice", "127.0.0.1:0"}, func(k string) (string, bool) {
+			if k == "SURFACE_CONNECTOR_TOKEN" {
+				return "dev", true
+			}
+			return "", false
+		}, logger, strings.NewReader("quit\n"))
+	})
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	for _, word := range []string{"lookup", "connect", "accept", "reject", "quit"} {
+		if !strings.Contains(text, word) {
+			t.Fatalf("commands missing %s\n%s", word, text)
+		}
 	}
 }
