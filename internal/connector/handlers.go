@@ -321,13 +321,16 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	ids := append([]string(nil), h.byToKey[key]...)
 	out := make([]ConnectRequest, 0)
+	var dropped []droppedRequest
 	for _, id := range ids {
 		cr := h.byID[id]
 		if cr == nil {
 			continue
 		}
 		if !RequestReadable(now, cr.expiresAt) {
-			h.removeLocked(id)
+			if item, ok := h.removeLocked(id); ok {
+				dropped = append(dropped, item)
+			}
 			continue
 		}
 		if cr.Status == "pending" {
@@ -335,6 +338,7 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.mu.Unlock()
+	h.forgetRequests(r.Context(), dropped)
 
 	h.writeJSON(w, 0, out)
 }
@@ -349,19 +353,25 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	cr, ok := h.byID[id]
 	if !ok || !RequestReadable(h.clock(), cr.expiresAt) {
+		item, removed := droppedRequest{}, false
 		if ok {
-			h.removeLocked(id)
+			item, removed = h.removeLocked(id)
 		}
 		h.mu.Unlock()
+		if removed {
+			h.forgetRequests(r.Context(), []droppedRequest{item})
+		}
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
 	now := h.clock()
+	life := h.requestLifetime()
 	cr.Status = "accepted"
-	cr.expiresAt = RequestDeadline(cr.Created, now, true, h.requestLifetime())
+	cr.expiresAt = RequestDeadline(cr.Created, now, true, life)
+	stored := *cr
 	h.mu.Unlock()
 
-	_ = h.cache.UpdateRequestStatus(r.Context(), id, "accepted", h.requestLifetime())
+	_ = h.cache.SetRequest(r.Context(), &stored, life)
 
 	h.writeJSON(w, 0, map[string]string{"status": "accepted"})
 }
@@ -376,19 +386,25 @@ func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	cr, ok := h.byID[id]
 	if !ok || !RequestReadable(h.clock(), cr.expiresAt) {
+		item, removed := droppedRequest{}, false
 		if ok {
-			h.removeLocked(id)
+			item, removed = h.removeLocked(id)
 		}
 		h.mu.Unlock()
+		if removed {
+			h.forgetRequests(r.Context(), []droppedRequest{item})
+		}
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
 	now := h.clock()
+	life := h.requestLifetime()
 	cr.Status = "rejected"
-	cr.expiresAt = RequestDeadline(cr.Created, now, true, h.requestLifetime())
+	cr.expiresAt = RequestDeadline(cr.Created, now, true, life)
+	stored := *cr
 	h.mu.Unlock()
 
-	_ = h.cache.UpdateRequestStatus(r.Context(), id, "rejected", h.requestLifetime())
+	_ = h.cache.SetRequest(r.Context(), &stored, life)
 
 	h.logger.Info("request rejected", "id", id)
 	h.writeJSON(w, 0, map[string]string{"status": "rejected"})
@@ -404,10 +420,14 @@ func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	cr, ok := h.byID[id]
 	if !ok || !RequestReadable(h.clock(), cr.expiresAt) {
+		item, removed := droppedRequest{}, false
 		if ok {
-			h.removeLocked(id)
+			item, removed = h.removeLocked(id)
 		}
 		h.mu.Unlock()
+		if removed {
+			h.forgetRequests(r.Context(), []droppedRequest{item})
+		}
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
@@ -417,11 +437,16 @@ func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, 0, &copy)
 }
 
-func (h *Handlers) removeLocked(id string) {
+type droppedRequest struct {
+	id    string
+	toKey string
+}
+
+func (h *Handlers) removeLocked(id string) (droppedRequest, bool) {
 	cr := h.byID[id]
 	delete(h.byID, id)
 	if cr == nil {
-		return
+		return droppedRequest{}, false
 	}
 	ids := h.byToKey[cr.ToKey]
 	dst := 0
@@ -433,9 +458,122 @@ func (h *Handlers) removeLocked(id string) {
 	}
 	if dst == 0 {
 		delete(h.byToKey, cr.ToKey)
+	} else {
+		h.byToKey[cr.ToKey] = ids[:dst]
+	}
+	return droppedRequest{id: id, toKey: cr.ToKey}, true
+}
+
+func (h *Handlers) forgetRequests(ctx context.Context, dropped []droppedRequest) {
+	if h.cache == nil || len(dropped) == 0 {
 		return
 	}
-	h.byToKey[cr.ToKey] = ids[:dst]
+	for _, item := range dropped {
+		_ = h.cache.DelRequest(ctx, item.id, item.toKey)
+	}
+}
+
+// applyStored copies still-readable stored requests into the maps.
+// A past deadline is returned so the caller can delete it after releasing h.mu.
+// It does not call Redis.
+func (h *Handlers) applyStored(records []storedRequest) (inserted, skipped int, drops []droppedRequest) {
+	now := h.clock()
+	life := h.requestLifetime()
+	ready := make([]*ConnectRequest, 0, len(records))
+	for i := range records {
+		rec := &records[i]
+		deadline, keep, skip, drop := classifyStored(rec, now, life)
+		if skip {
+			skipped++
+			continue
+		}
+		if drop {
+			if rec.ID != "" {
+				drops = append(drops, droppedRequest{id: rec.ID, toKey: rec.ToKey})
+			}
+			continue
+		}
+		if !keep {
+			continue
+		}
+		cp := new(ConnectRequest)
+		*cp = rec.ConnectRequest
+		cp.expiresAt = deadline
+		ready = append(ready, cp)
+	}
+	h.mu.Lock()
+	if h.byID == nil {
+		h.byID = make(map[string]*ConnectRequest)
+	}
+	if h.byToKey == nil {
+		h.byToKey = make(map[string][]string)
+	}
+	for _, cr := range ready {
+		if _, exists := h.byID[cr.ID]; exists {
+			h.byID[cr.ID] = cr
+			continue
+		}
+		h.byID[cr.ID] = cr
+		h.byToKey[cr.ToKey] = append(h.byToKey[cr.ToKey], cr.ID)
+		inserted++
+	}
+	h.mu.Unlock()
+	if inserted > 0 && h.logger != nil {
+		h.logger.Info("restored requests", "count", inserted)
+	}
+	if skipped > 0 && h.logger != nil {
+		h.logger.Info("pending restore skipped", "count", skipped)
+	}
+	return inserted, skipped, drops
+}
+
+func classifyStored(rec *storedRequest, now time.Time, life time.Duration) (deadline time.Time, keep, skip, drop bool) {
+	switch rec.Status {
+	case "pending":
+		deadline = rec.ExpiresAt
+		if deadline.IsZero() {
+			deadline = RequestDeadline(rec.Created, time.Time{}, false, life)
+		}
+	case "accepted", "rejected":
+		if rec.ExpiresAt.IsZero() {
+			return time.Time{}, false, true, false
+		}
+		deadline = rec.ExpiresAt
+	default:
+		return time.Time{}, false, false, false
+	}
+	if !RequestReadable(now, deadline) {
+		return deadline, false, false, true
+	}
+	return deadline, true, false, false
+}
+
+// LoadRequests fills byID and byToKey from the shared pending store.
+// A nil cache does not scan. A failed scan leaves both maps empty.
+func (h *Handlers) LoadRequests(ctx context.Context) error {
+	if h == nil || h.cache == nil || h.cache.client == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	records, skipped, err := h.cache.fetchStored(ctx)
+	if err != nil {
+		h.mu.Lock()
+		h.byID = make(map[string]*ConnectRequest)
+		h.byToKey = make(map[string][]string)
+		h.mu.Unlock()
+		if h.logger != nil {
+			h.logger.Info("pending store unavailable, continuing without restore")
+		}
+		return err
+	}
+	_, _, drops := h.applyStored(records)
+	h.forgetRequests(ctx, drops)
+	if skipped > 0 && h.logger != nil {
+		h.logger.Info("pending restore skipped", "count", skipped)
+	}
+	return nil
 }
 
 // pruneOnce drops expired in-process requests and stale peer rows.
@@ -456,10 +594,14 @@ func (h *Handlers) pruneOnce(ctx context.Context) {
 			drop = append(drop, id)
 		}
 	}
+	var dropped []droppedRequest
 	for _, id := range drop {
-		h.removeLocked(id)
+		if item, ok := h.removeLocked(id); ok {
+			dropped = append(dropped, item)
+		}
 	}
 	h.mu.Unlock()
+	h.forgetRequests(ctx, dropped)
 
 	if len(drop) > 0 && h.logger != nil {
 		h.logger.Info("pruned requests", "count", len(drop))

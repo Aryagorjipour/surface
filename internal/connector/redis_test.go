@@ -208,6 +208,167 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	}
 }
 
+func TestRedisRestart(t *testing.T) {
+	addr := os.Getenv("SURFACE_TEST_REDIS")
+	if addr == "" {
+		t.Skip("SURFACE_TEST_REDIS unset")
+	}
+	cache := NewRedis(addr, "")
+	ctx := context.Background()
+	if err := cache.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	store := testStore(t)
+	const life = time.Minute
+	now := time.Date(2026, 10, 16, 16, 0, 0, 0, time.UTC)
+	newHandlers := func(clock *time.Time) *Handlers {
+		h := NewHandlers(store, cache, slog.New(slog.DiscardHandler))
+		h.SetNow(func() time.Time { return *clock })
+		h.SetLifetime(life)
+		return h
+	}
+	h := newHandlers(&now)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	targetA := "restart-a-" + suffix
+	targetB := "restart-b-" + suffix
+	caller := "restart-caller-" + suffix
+	const fromAddr = "203.0.113.40:40"
+	t.Cleanup(func() {
+		_ = cache.client.Del(ctx, "pending:"+targetA, "pending:"+targetB).Err()
+	})
+
+	for _, key := range []string{targetA, targetB, caller} {
+		rec := postMux(mux, "/peers", peerJSON(key, "203.0.113.20:20", "available"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("register %s %d %s", key, rec.Code, rec.Body.String())
+		}
+	}
+	idA := mustConnect(t, mux, caller, targetA, fromAddr)
+	idB := mustConnect(t, mux, caller, targetB, fromAddr)
+	t.Cleanup(func() {
+		_ = cache.client.Del(ctx, "req:"+idA, "req:"+idB).Err()
+	})
+
+	raw, err := cache.client.Get(ctx, "req:"+idA).Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "expires_at") {
+		t.Fatalf("stored body missing expires_at: %s", raw)
+	}
+
+	h2 := newHandlers(&now)
+	if err := h2.LoadRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mux2 := http.NewServeMux()
+	h2.Register(mux2)
+
+	rec := getReq(mux2, "/pending?key="+targetA, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending %d %s", rec.Code, rec.Body.String())
+	}
+	body := strings.TrimRight(rec.Body.String(), "\n")
+	for _, want := range []string{
+		`"request_id":"` + idA + `"`,
+		`"from_key":"` + caller + `"`,
+		`"from_address":"` + fromAddr + `"`,
+		`"to_key":"` + targetA + `"`,
+		`"status":"pending"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("pending body %s missing %s", body, want)
+		}
+	}
+	if strings.Contains(body, idB) {
+		t.Fatalf("pending list included the other target: %s", body)
+	}
+	rec = getReq(mux2, "/requests/"+idA, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+	}
+	statusBody := strings.TrimRight(rec.Body.String(), "\n")
+	for _, want := range []string{
+		`"request_id":"` + idA + `"`,
+		`"from_key":"` + caller + `"`,
+		`"from_address":"` + fromAddr + `"`,
+		`"to_key":"` + targetA + `"`,
+		`"status":"pending"`,
+	} {
+		if !strings.Contains(statusBody, want) {
+			t.Fatalf("status body %s missing %s", statusBody, want)
+		}
+	}
+	if strings.Contains(statusBody, "expires_at") {
+		t.Fatalf("status body contains expires_at: %s", statusBody)
+	}
+
+	rec = postMux(mux2, "/requests/"+idA+"/accept", "")
+	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+
+	h3now := now
+	h3 := newHandlers(&h3now)
+	if err := h3.LoadRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mux3 := http.NewServeMux()
+	h3.Register(mux3)
+	rec = getReq(mux3, "/requests/"+idA, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restored decision %d %s", rec.Code, rec.Body.String())
+	}
+	decisionBody := strings.TrimRight(rec.Body.String(), "\n")
+	if !strings.Contains(decisionBody, `"status":"accepted"`) || strings.Contains(decisionBody, "expires_at") {
+		t.Fatalf("decision body %s", decisionBody)
+	}
+	pendingAfter := strings.TrimRight(getReq(mux3, "/pending?key="+targetA, "").Body.String(), "\n")
+	if strings.Contains(pendingAfter, idA) {
+		t.Fatalf("accepted id returned on the pending list: %s", pendingAfter)
+	}
+
+	h3.mu.RLock()
+	deadline := h3.byID[idA].expiresAt
+	h3.mu.RUnlock()
+	h3now = deadline.Add(time.Nanosecond)
+	rec = getReq(mux3, "/requests/"+idA, "")
+	requirePhrase(t, rec, http.StatusNotFound, "request not found")
+	n, err := cache.client.Exists(ctx, "req:"+idA).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("req key survived the deadline")
+	}
+	ids, err := cache.PendingIDs(ctx, targetA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsID(ids, idA) {
+		t.Fatalf("pending set still has %s: %#v", idA, ids)
+	}
+
+	h4now := h3now
+	h4 := newHandlers(&h4now)
+	if err := h4.LoadRequests(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mux4 := http.NewServeMux()
+	h4.Register(mux4)
+	rec = getReq(mux4, "/requests/"+idA, "")
+	requirePhrase(t, rec, http.StatusNotFound, "request not found")
+	rec = getReq(mux4, "/pending?key="+targetA, "")
+	requirePhrase(t, rec, http.StatusOK, "[]")
+}
+
 func containsID(ids []string, id string) bool {
 	for _, item := range ids {
 		if item == id {
