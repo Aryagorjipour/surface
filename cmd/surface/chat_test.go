@@ -206,7 +206,7 @@ func assertSpanClean(t *testing.T, sp sdktrace.ReadOnlySpan, proof []byte, proof
 	t.Helper()
 	text := sp.Name()
 	for _, attr := range sp.Attributes() {
-		text += " " + string(attr.Key) + "=" + attr.Value.Emit()
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
 	}
 	for _, secret := range []string{string(proof), proofText, key, addr, "surface-round-trip"} {
 		if secret != "" && strings.Contains(text, secret) {

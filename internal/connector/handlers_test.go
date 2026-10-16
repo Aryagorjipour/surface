@@ -1565,7 +1565,7 @@ func TestActionSpans(t *testing.T) {
 	for _, sp := range rec.Ended() {
 		text := sp.Name()
 		for _, attr := range sp.Attributes() {
-			text += " " + string(attr.Key) + "=" + attr.Value.Emit()
+			text += " " + string(attr.Key) + "=" + attr.Value.String()
 		}
 		for _, secret := range []string{key, addr, token, "surface-round-trip"} {
 			if strings.Contains(text, secret) {
@@ -1609,7 +1609,7 @@ func TestHealth(t *testing.T) {
 	assertActionSpan(t, ended[len(ended)-1], "GET /health", http.StatusOK)
 	text := ended[len(ended)-1].Name()
 	for _, attr := range ended[len(ended)-1].Attributes() {
-		text += " " + string(attr.Key) + "=" + attr.Value.Emit()
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
 	}
 	for _, secret := range []string{"canary-peer-key", "203.0.113.10:9001"} {
 		if strings.Contains(text, secret) || strings.Contains(qrec.Body.String(), secret) {
@@ -1632,7 +1632,7 @@ func TestHealth(t *testing.T) {
 	assertActionSpan(t, ended[len(ended)-1], "GET /health", http.StatusOK)
 	text = ended[len(ended)-1].Name()
 	for _, attr := range ended[len(ended)-1].Attributes() {
-		text += " " + string(attr.Key) + "=" + attr.Value.Emit()
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
 	}
 	for _, secret := range []string{"canary-peer-key", "203.0.113.10:9001"} {
 		if strings.Contains(text, secret) || strings.Contains(erec.Body.String(), secret) {

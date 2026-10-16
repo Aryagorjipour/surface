@@ -178,7 +178,7 @@ func probeReady() error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32))
 	if err != nil {
 		return err
@@ -195,7 +195,7 @@ func listenPunch(ctx context.Context, addr string, h *connector.Handlers) error 
 	if err != nil {
 		return err
 	}
-	defer pc.Close()
+	defer func() { _ = pc.Close() }()
 	go func() {
 		<-ctx.Done()
 		_ = pc.Close()

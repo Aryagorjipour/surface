@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
-	"sync"
 )
 
 const punchTicketBytes = 16
@@ -17,7 +16,6 @@ type punchObs struct {
 }
 
 type punchBook struct {
-	mu     sync.Mutex
 	byReq  map[string]*punchObs
 	closed map[string]struct{}
 	udp    map[string]string

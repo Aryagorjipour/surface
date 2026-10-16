@@ -164,7 +164,7 @@ func TestPunchObservation(t *testing.T) {
 		}
 		text := sp.Name()
 		for _, attr := range sp.Attributes() {
-			text += " " + string(attr.Key) + "=" + attr.Value.Emit()
+			text += " " + string(attr.Key) + "=" + attr.Value.String()
 		}
 		for _, secret := range []string{hexA, hexB, hexC, srcA, srcB, srcC, canary, token} {
 			if strings.Contains(text, secret) {

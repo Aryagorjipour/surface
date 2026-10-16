@@ -218,7 +218,9 @@ func (a *app) handleLine(line string) error {
 		from := a.callerFor(parts[1])
 		a.gate.remember(parts[1], from, a.myKey, raw)
 		a.say("accepted — waiting for peer to dial")
-		go a.attempt(false, "", parts[1], from, a.myKey, raw)
+		go func() {
+			_ = a.attempt(false, "", parts[1], from, a.myKey, raw)
+		}()
 	case "reject":
 		if len(parts) < 2 {
 			fmt.Println("usage: reject <request-id>")
@@ -508,7 +510,7 @@ func (a *app) say(args ...any) {
 		fmt.Println(args...)
 		return
 	}
-	fmt.Fprintln(a.out, args...)
+	_, _ = fmt.Fprintln(a.out, args...)
 }
 
 func (a *app) callerFor(id string) string {
