@@ -28,7 +28,7 @@ func TestRedisExpiry(t *testing.T) {
 	})
 
 	store := testStore(t)
-	h := NewHandlers(store, cache, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, cache, slog.New(slog.DiscardHandler))
 	h.SetLifetime(time.Second)
 	mux := http.NewServeMux()
 	h.Register(mux)
@@ -82,7 +82,7 @@ func TestRedisExpiry(t *testing.T) {
 	}
 
 	rec = postMux(mux, "/requests/"+idB+"/accept", "")
-	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+	requireAccepted(t, rec)
 	ttl, err := cache.client.TTL(ctx, "req:"+idB).Result()
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 
 	store := testStore(t)
 	capture := &slogCapture{}
-	h := NewHandlers(store, cache, slog.New(capture))
+	h := newTestHandlers(store, cache, slog.New(capture))
 	var now time.Time
 	now = time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
@@ -228,7 +228,7 @@ func TestRedisRestart(t *testing.T) {
 	const life = time.Minute
 	now := time.Date(2026, 10, 16, 16, 0, 0, 0, time.UTC)
 	newHandlers := func(clock *time.Time) *Handlers {
-		h := NewHandlers(store, cache, slog.New(slog.DiscardHandler))
+		h := newTestHandlers(store, cache, slog.New(slog.DiscardHandler))
 		h.SetNow(func() time.Time { return *clock })
 		h.SetLifetime(life)
 		return h
@@ -313,7 +313,7 @@ func TestRedisRestart(t *testing.T) {
 	}
 
 	rec = postMux(mux2, "/requests/"+idA+"/accept", "")
-	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+	requireAccepted(t, rec)
 
 	h3now := now
 	h3 := newHandlers(&h3now)

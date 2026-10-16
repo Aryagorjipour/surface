@@ -56,7 +56,7 @@ func TestParseExpiryConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if def.RequestLifetime != 10*time.Minute || def.SilenceWindow != 24*time.Hour {
+	if def.RequestLifetime != 10*time.Minute || def.SilenceWindow != 90*time.Second {
 		t.Fatalf("nil lookup %+v", def)
 	}
 	missing, err := ParseExpiryConfig(func(string) (string, bool) { return "", false })
@@ -68,24 +68,20 @@ func TestParseExpiryConfig(t *testing.T) {
 	}
 
 	got, err := ParseExpiryConfig(func(k string) (string, bool) {
-		switch k {
-		case "SURFACE_REQUEST_LIFETIME":
+		if k == "SURFACE_REQUEST_LIFETIME" {
 			return "2s", true
-		case "SURFACE_SILENCE_WINDOW":
-			return "3s", true
-		default:
-			return "", false
 		}
+		return "", false
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RequestLifetime != 2*time.Second || got.SilenceWindow != 3*time.Second {
+	if got.RequestLifetime != 2*time.Second || got.SilenceWindow != 90*time.Second {
 		t.Fatalf("parsed %+v", got)
 	}
 
 	empty, err := ParseExpiryConfig(func(k string) (string, bool) {
-		if k == "SURFACE_REQUEST_LIFETIME" || k == "SURFACE_SILENCE_WINDOW" {
+		if k == "SURFACE_REQUEST_LIFETIME" {
 			return "", true
 		}
 		return "", false
@@ -100,13 +96,14 @@ func TestParseExpiryConfig(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
+		want string
 	}{
-		{"SURFACE_REQUEST_LIFETIME", "0s"},
-		{"SURFACE_REQUEST_LIFETIME", "-1s"},
-		{"SURFACE_REQUEST_LIFETIME", "nope"},
-		{"SURFACE_SILENCE_WINDOW", "0s"},
-		{"SURFACE_SILENCE_WINDOW", "-1s"},
-		{"SURFACE_SILENCE_WINDOW", "nope"},
+		{"SURFACE_REQUEST_LIFETIME", "0s", "not a positive duration"},
+		{"SURFACE_REQUEST_LIFETIME", "-1s", "not a positive duration"},
+		{"SURFACE_REQUEST_LIFETIME", "nope", "not a positive duration"},
+		{"SURFACE_SILENCE_WINDOW", "0s", "retired"},
+		{"SURFACE_SILENCE_WINDOW", "-1s", "retired"},
+		{"SURFACE_SILENCE_WINDOW", "nope", "retired"},
 	}
 	for _, tc := range cases {
 		_, err := ParseExpiryConfig(func(k string) (string, bool) {
@@ -119,7 +116,7 @@ func TestParseExpiryConfig(t *testing.T) {
 			t.Fatalf("%s %q accepted", tc.name, tc.raw)
 		}
 		msg := err.Error()
-		if !strings.Contains(msg, tc.name) || !strings.Contains(msg, "not a positive duration") {
+		if !strings.Contains(msg, tc.name) || !strings.Contains(msg, tc.want) {
 			t.Fatalf("%s %q: %s", tc.name, tc.raw, msg)
 		}
 		if strings.Contains(msg, tc.raw) {

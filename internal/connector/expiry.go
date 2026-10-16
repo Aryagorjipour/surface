@@ -11,29 +11,29 @@ type ExpiryConfig struct {
 	SilenceWindow   time.Duration
 }
 
-// DefaultExpiryConfig returns a 10-minute request lifetime and a 24-hour silence window.
+// DefaultExpiryConfig returns a 10-minute request lifetime and a 90-second liveness window.
 func DefaultExpiryConfig() ExpiryConfig {
 	return ExpiryConfig{
 		RequestLifetime: 10 * time.Minute,
-		SilenceWindow:   24 * time.Hour,
+		SilenceWindow:   90 * time.Second,
 	}
 }
 
-// ParseExpiryConfig reads the two durations through lookup.
+// ParseExpiryConfig reads the request lifetime through lookup.
 // It does not read the process environment itself.
-// A missing or empty value keeps the default. A zero, negative, or unreadable value is refused.
+// A missing or empty lifetime keeps the default. A zero, negative, or unreadable value is refused.
 // The error names the variable and does not include the raw text.
+// Any presence of SURFACE_SILENCE_WINDOW is refused. That setting is retired.
 func ParseExpiryConfig(lookup func(string) (string, bool)) (ExpiryConfig, error) {
 	cfg := DefaultExpiryConfig()
 	if lookup == nil {
 		return cfg, nil
 	}
+	if _, ok := lookup("SURFACE_SILENCE_WINDOW"); ok {
+		return ExpiryConfig{}, fmt.Errorf("SURFACE_SILENCE_WINDOW is retired")
+	}
 	var err error
 	cfg.RequestLifetime, err = positiveDuration(lookup, "SURFACE_REQUEST_LIFETIME", cfg.RequestLifetime)
-	if err != nil {
-		return ExpiryConfig{}, err
-	}
-	cfg.SilenceWindow, err = positiveDuration(lookup, "SURFACE_SILENCE_WINDOW", cfg.SilenceWindow)
 	if err != nil {
 		return ExpiryConfig{}, err
 	}
