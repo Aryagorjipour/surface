@@ -8,6 +8,9 @@ import (
 
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/coder/websocket"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func connectedPrompt(dialer bool) string {
@@ -46,7 +49,7 @@ func (g *Gate) session(requestID string) *session.Session {
 	return g.live[requestID]
 }
 
-func (g *Gate) dialAdmitted(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
+func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
 	msg, st, err := session.Offer(requestID, callerKey, targetKey, proof)
 	if err != nil {
 		return nil, err
@@ -61,7 +64,7 @@ func (g *Gate) dialAdmitted(ctx context.Context, conn *websocket.Conn, requestID
 	return session.FinishOffer(reply, st)
 }
 
-func (g *Gate) acceptAdmitted(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+func (g *Gate) acceptAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
 	_, msg, err := conn.Read(ctx)
 	if err != nil {
 		return err
@@ -69,7 +72,10 @@ func (g *Gate) acceptAdmitted(ctx context.Context, conn *websocket.Conn, request
 	return g.finishAdmit(ctx, conn, msg, requestID, callerKey, targetKey, proof, ready)
 }
 
-func (g *Gate) finishAdmit(ctx context.Context, conn *websocket.Conn, msg []byte, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+	_, span := startAcceptSpan(ctx)
+	status := "refused"
+	defer endAcceptSpan(&span, &status)
 	g.mu.Lock()
 	_, spent := g.live[requestID]
 	check := g.readable
@@ -92,6 +98,8 @@ func (g *Gate) finishAdmit(ctx context.Context, conn *websocket.Conn, msg []byte
 	}
 	g.live[requestID] = sess
 	g.mu.Unlock()
+	status = "accepted"
+	endAcceptSpan(&span, &status)
 	if ready != nil {
 		ready(sess)
 	}
@@ -99,28 +107,25 @@ func (g *Gate) finishAdmit(ctx context.Context, conn *websocket.Conn, msg []byte
 }
 
 // take reads the first frame. An admission calls ready. A resume does not.
-func (g *Gate) take(ctx context.Context, conn *websocket.Conn, now, deadline time.Time, ready func(*session.Session)) (*session.Session, error) {
+func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time, ready func(*session.Session)) (*session.Session, error) {
 	_, msg, err := conn.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(msg) == 0 {
-		_ = conn.Close(websocket.StatusPolicyViolation, "")
-		return nil, fmt.Errorf("refused")
+		return refuseAccept(ctx, conn)
 	}
 	switch msg[0] {
 	case 0x01:
 		id, caller, err := session.OfferNames(msg)
 		if err != nil {
-			_ = conn.Close(websocket.StatusPolicyViolation, "")
-			return nil, err
+			return refuseAccept(ctx, conn)
 		}
 		g.mu.Lock()
 		inv, ok := g.invites[id]
 		g.mu.Unlock()
 		if !ok || inv.caller != caller {
-			_ = conn.Close(websocket.StatusPolicyViolation, "")
-			return nil, fmt.Errorf("refused")
+			return refuseAccept(ctx, conn)
 		}
 		if err := g.finishAdmit(ctx, conn, msg, id, caller, inv.target, inv.proof, ready); err != nil {
 			return nil, err
@@ -129,12 +134,14 @@ func (g *Gate) take(ctx context.Context, conn *websocket.Conn, now, deadline tim
 	case 0x05:
 		id, _, _, _, err := resumeID(msg)
 		if err != nil {
+			recordRefused(ctx)
 			_ = conn.Close(websocket.StatusPolicyViolation, "")
 			return nil, err
 		}
 		sess := g.session(id)
 		reply, err := session.AcceptResume(sess, msg, now, deadline)
 		if err != nil {
+			recordRefused(ctx)
 			_ = conn.Close(websocket.StatusPolicyViolation, "")
 			return nil, err
 		}
@@ -148,9 +155,41 @@ func (g *Gate) take(ctx context.Context, conn *websocket.Conn, now, deadline tim
 		}
 		return sess, nil
 	default:
-		_ = conn.Close(websocket.StatusPolicyViolation, "")
-		return nil, fmt.Errorf("refused")
+		return refuseAccept(ctx, conn)
 	}
+}
+
+func refuseAccept(ctx context.Context, conn byteConn) (*session.Session, error) {
+	recordRefused(ctx)
+	_ = conn.Close(websocket.StatusPolicyViolation, "")
+	return nil, fmt.Errorf("refused")
+}
+
+func recordRefused(ctx context.Context) {
+	_, span := startAcceptSpan(ctx)
+	status := "refused"
+	endAcceptSpan(&span, &status)
+}
+
+func startAcceptSpan(ctx context.Context) (context.Context, trace.Span) {
+	return otel.Tracer("github.com/Aryagorjipour/surface/surface").Start(ctx, "websocket accept")
+}
+
+func endAcceptSpan(span *trace.Span, status *string) {
+	if span == nil || *span == nil {
+		return
+	}
+	current := *span
+	*span = nil
+	value := "refused"
+	if status != nil && *status != "" {
+		value = *status
+	}
+	current.SetAttributes(
+		attribute.String("endpoint", "websocket accept"),
+		attribute.String("status", value),
+	)
+	current.End()
 }
 
 func resumeID(msg []byte) (string, uint64, uint64, []byte, error) {
@@ -158,7 +197,7 @@ func resumeID(msg []byte) (string, uint64, uint64, []byte, error) {
 }
 
 // pushResume sends a resume offer, accepts the reply, then seals lines in order.
-func pushResume(ctx context.Context, conn *websocket.Conn, sess *session.Session, now, deadline time.Time, lines []string) error {
+func pushResume(ctx context.Context, conn byteConn, sess *session.Session, now, deadline time.Time, lines []string) error {
 	offer, err := session.ResumeOffer(sess)
 	if err != nil {
 		return err

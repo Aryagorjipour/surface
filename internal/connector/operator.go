@@ -26,6 +26,9 @@ type Operator struct {
 	SecretStoreSet  bool
 	TraceEndpoint   string
 	TraceSet        bool
+	Punch           string
+	PunchSet        bool
+	Ready           bool
 }
 
 // ConnectorHelp is the text connector --help prints. It lists every flag and default.
@@ -57,6 +60,10 @@ func ConnectorHelp() string {
         secret store address (default the Vault client address)
   --trace-endpoint endpoint
         trace endpoint (default unset)
+  --punch address
+        punch listen address (default 127.0.0.1:8081)
+  --ready
+        probe http://127.0.0.1:8080/health and exit
   --config path
         config file (default unset)
   --help
@@ -78,6 +85,7 @@ var connectorFileKeys = map[string]struct{}{
 	"SURFACE_CACHE_ADDR":           {},
 	"VAULT_ADDR":                   {},
 	"OTEL_EXPORTER_OTLP_ENDPOINT":  {},
+	"SURFACE_PUNCH_ADDR":           {},
 	"SURFACE_CONFIG":               {},
 }
 
@@ -118,15 +126,20 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	cacheAddr := fs.String("cache-addr", "", "cache address")
 	secretAddr := fs.String("secret-store-addr", "", "secret store address")
 	trace := fs.String("trace-endpoint", "", "trace endpoint")
+	punch := fs.String("punch", "127.0.0.1:8081", "punch listen address")
+	ready := fs.Bool("ready", false, "probe health")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
 		return Operator{}, err
 	}
+	if fs.NArg() > 0 {
+		return Operator{}, fmt.Errorf("unexpected argument")
+	}
 	if *help {
 		return Operator{}, ErrHelp
 	}
-	if fs.NArg() > 0 {
-		return Operator{}, fmt.Errorf("unexpected argument")
+	if *ready {
+		return Operator{Ready: true}, nil
 	}
 
 	set := map[string]bool{}
@@ -182,6 +195,7 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	cache, cacheSet := pick(set["cache-addr"], *cacheAddr, lookup, file, "SURFACE_CACHE_ADDR", "", false)
 	vaultAddr, vaultSet := pick(set["secret-store-addr"], *secretAddr, lookup, file, "VAULT_ADDR", "", true)
 	traceEndpoint, traceSet := pick(set["trace-endpoint"], *trace, lookup, file, "OTEL_EXPORTER_OTLP_ENDPOINT", "", true)
+	punchAddr, punchSet := resolvePunch(set["punch"], *punch, lookup, file)
 
 	return Operator{
 		Listen:          listenAddr,
@@ -195,7 +209,24 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 		SecretStoreSet:  vaultSet,
 		TraceEndpoint:   traceEndpoint,
 		TraceSet:        traceSet,
+		Punch:           punchAddr,
+		PunchSet:        punchSet,
 	}, nil
+}
+
+// resolvePunch applies flag, then environment, then file. An empty value after trim disables punch.
+// An unset value keeps the loopback default.
+func resolvePunch(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string) (string, bool) {
+	if flagSet {
+		return strings.TrimSpace(flagVal), true
+	}
+	if raw, ok := lookup("SURFACE_PUNCH_ADDR"); ok {
+		return strings.TrimSpace(raw), true
+	}
+	if raw, ok := file["SURFACE_PUNCH_ADDR"]; ok {
+		return strings.TrimSpace(raw), true
+	}
+	return "127.0.0.1:8081", false
 }
 
 func flagValue(name string, listen, life, heartbeat, maintenance, source, keyAllow, maxKey, maxAddr, maxID, maxBody, cacheAddr, secretAddr, trace, configPath *string) string {

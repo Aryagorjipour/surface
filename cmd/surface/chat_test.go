@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,206 @@ import (
 
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/coder/websocket"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
+
+func TestWebsocketAcceptSpan(t *testing.T) {
+	rec := installSurfaceSpans(t)
+	const (
+		caller = "canary-peer-key"
+		target = "target"
+		addr   = "203.0.113.10:9001"
+	)
+	raw, text, err := session.NewProof()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	g := &Gate{}
+	g.remember("req-ok", caller, target, raw)
+	client, server := wsPair(t)
+	errCh := make(chan error, 1)
+	readySpans := make(chan int, 1)
+	out := captureStdout(t, func() {
+		go func() {
+			_, err := g.take(ctx, server, time.Now(), time.Time{}, func(*session.Session) {
+				readySpans <- len(rec.Ended())
+				fmt.Println(connectedPrompt(false))
+			})
+			errCh <- err
+		}()
+		dialer, err := g.dialAdmitted(ctx, client, "req-ok", caller, target, raw)
+		if err != nil {
+			t.Errorf("dial %v", err)
+			return
+		}
+		if err := <-errCh; err != nil {
+			t.Error(err)
+		}
+		select {
+		case n := <-readySpans:
+			if n != 1 {
+				t.Errorf("span count at the connected line: %d", n)
+			}
+		default:
+			t.Error("connected line ran before the span ended")
+		}
+		if _, err := session.Seal(dialer, "surface-round-trip", 0); err != nil {
+			t.Error(err)
+		}
+	})
+	if !exactLine(out, connectedPrompt(false)) {
+		t.Fatalf("listener prompt missing from %q", out)
+	}
+	if exactLine(out, connectedPrompt(true)) {
+		t.Fatalf("dialer prompt printed by the listener path %q", out)
+	}
+	if len(rec.Ended()) != 1 {
+		t.Fatalf("completed handshake spans %d", len(rec.Ended()))
+	}
+	assertWebsocketSpan(t, rec.Ended()[0], "accepted")
+	assertSpanClean(t, rec.Ended()[0], raw, text, caller, addr)
+
+	bad, _, err := session.NewProof()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.remember("req-bad", caller, target, bad)
+	client, server = wsPair(t)
+	refusedOut := captureStdout(t, func() {
+		errCh = make(chan error, 1)
+		go func() {
+			_, err := g.take(ctx, server, time.Now(), time.Time{}, func(*session.Session) {
+				fmt.Println(connectedPrompt(false))
+				fmt.Println(connectedPrompt(true))
+			})
+			errCh <- err
+		}()
+		_, _ = g.dialAdmitted(ctx, client, "req-bad", caller, target, raw)
+		<-errCh
+	})
+	if exactLine(refusedOut, connectedPrompt(true)) || exactLine(refusedOut, connectedPrompt(false)) {
+		t.Fatalf("refused handshake printed %q", refusedOut)
+	}
+	if len(rec.Ended()) != 2 {
+		t.Fatalf("spans after refusal %d", len(rec.Ended()))
+	}
+	assertWebsocketSpan(t, rec.Ended()[1], "refused")
+	assertSpanClean(t, rec.Ended()[1], raw, text, caller, addr)
+
+	client, server = wsPair(t)
+	missing, _, err := session.Offer("req-miss", caller, target, make([]byte, session.ProofBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missCh := make(chan error, 1)
+	go func(conn *websocket.Conn) {
+		_, err := g.take(ctx, conn, time.Now(), time.Time{}, func(*session.Session) {
+			fmt.Println(connectedPrompt(false))
+		})
+		missCh <- err
+	}(server)
+	if err := client.Write(ctx, websocket.MessageBinary, missing); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _ = client.Read(ctx)
+	select {
+	case missErr := <-missCh:
+		if missErr == nil {
+			t.Fatal("missing proof was accepted")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("missing proof hung")
+	}
+	if len(rec.Ended()) != 3 {
+		t.Fatalf("spans after missing proof %d", len(rec.Ended()))
+	}
+	assertWebsocketSpan(t, rec.Ended()[2], "refused")
+
+	g.remember("req-later", caller, target, raw)
+	client, server = wsPair(t)
+	later := make(chan error, 1)
+	go func() {
+		_, err := g.take(ctx, server, time.Now(), time.Time{}, func(*session.Session) {})
+		later <- err
+	}()
+	if _, err := g.dialAdmitted(ctx, client, "req-later", caller, target, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-later; err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.Ended()) != 4 {
+		t.Fatalf("later handshake spans %d", len(rec.Ended()))
+	}
+	assertWebsocketSpan(t, rec.Ended()[3], "accepted")
+}
+
+func exactLine(out, want string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if line == want {
+			return true
+		}
+	}
+	return false
+}
+
+func installSurfaceSpans(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	prev := otel.GetTracerProvider()
+	rec := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	return rec
+}
+
+func assertWebsocketSpan(t *testing.T, sp sdktrace.ReadOnlySpan, status string) {
+	t.Helper()
+	if sp.Name() != "websocket accept" {
+		t.Fatalf("span name %q", sp.Name())
+	}
+	attrs := sp.Attributes()
+	if len(attrs) != 2 {
+		t.Fatalf("attributes %#v", attrs)
+	}
+	var endpoint, got string
+	for _, attr := range attrs {
+		switch string(attr.Key) {
+		case "endpoint":
+			if attr.Value.Type() != attribute.STRING {
+				t.Fatalf("endpoint type %s", attr.Value.Type())
+			}
+			endpoint = attr.Value.AsString()
+		case "status":
+			if attr.Value.Type() != attribute.STRING {
+				t.Fatalf("status type %s", attr.Value.Type())
+			}
+			got = attr.Value.AsString()
+		default:
+			t.Fatalf("unexpected attribute %s", attr.Key)
+		}
+	}
+	if endpoint != "websocket accept" || got != status {
+		t.Fatalf("endpoint %q status %q", endpoint, got)
+	}
+}
+
+func assertSpanClean(t *testing.T, sp sdktrace.ReadOnlySpan, proof []byte, proofText, key, addr string) {
+	t.Helper()
+	text := sp.Name()
+	for _, attr := range sp.Attributes() {
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
+	}
+	for _, secret := range []string{string(proof), proofText, key, addr, "surface-round-trip"} {
+		if secret != "" && strings.Contains(text, secret) {
+			t.Fatalf("span included private text")
+		}
+	}
+}
 
 func TestAdmitPrintsConnectedLines(t *testing.T) {
 	if connectedPrompt(true) != "connected — type messages (/quit to leave)" {

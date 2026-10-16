@@ -1,5 +1,5 @@
 services:
-  redis:
+  cache:
     image: redis:7-alpine
     ports:
       - "6379:6379"
@@ -16,9 +16,26 @@ services:
     environment:
       VAULT_DEV_ROOT_TOKEN_ID: root
       VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      VAULT_ADDR: http://127.0.0.1:8200
     cap_add:
       - IPC_LOCK
     command: server -dev
+    healthcheck:
+      test: vault status
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  bootstrap:
+    image: hashicorp/vault:1.17
+    restart: "no"
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: root
+    command: vault kv put secret/surface/connector turso_url=file:/app/data/surface.db turso_token=dev encryption_key=ZGV2LXN1cmZhY2Uta2V5LWRldi1zdXJmYWNlLWtleSE= connector_token=dev redis_addr=cache:6379
 
   connector:
     build:
@@ -26,16 +43,25 @@ services:
       dockerfile: deployments/Dockerfile.connector
     ports:
       - "8080:8080"
+      - "8081:8081"
     environment:
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: root
+      SURFACE_PUNCH_ADDR: ":8081"
     volumes:
       - connector-data:/app/data
     depends_on:
-      redis:
+      cache:
         condition: service_healthy
       vault:
-        condition: service_started
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: /app/connector --ready
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
 volumes:

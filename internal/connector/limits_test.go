@@ -2,7 +2,6 @@ package connector
 
 import (
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -201,48 +200,6 @@ func TestParseLimitConfig(t *testing.T) {
 		if !strings.Contains(msg, tc.key) || !strings.Contains(msg, tc.reason) || strings.Contains(msg, tc.val) {
 			t.Fatalf("%s=%s error %q", tc.key, tc.val, msg)
 		}
-	}
-}
-
-func TestScrubForTrace(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/peers/secret-key?key=secret-key", nil)
-	req.SetPathValue("key", "secret-key")
-	req.Header.Set("X-Forwarded-For", "203.0.113.5")
-	req.Header.Set("Forwarded", "for=203.0.113.5")
-	req.Header.Set("Authorization", "Bearer secret-token")
-	req.RemoteAddr = "198.51.100.10:9999"
-
-	got := ScrubForTrace(req, "GET /peers/{key}")
-	if got.URL.Path != "/peers/{key}" {
-		t.Fatalf("path %s", got.URL.Path)
-	}
-	if got.URL.RawQuery != "key=secret-key" {
-		t.Fatalf("query %s", got.URL.RawQuery)
-	}
-	if got.PathValue("key") != "secret-key" {
-		t.Fatalf("path value %s", got.PathValue("key"))
-	}
-	if got.Header.Get("X-Forwarded-For") != "" || got.Header.Get("Forwarded") != "" || got.Header.Get("Authorization") != "" {
-		t.Fatal("forwarded headers kept")
-	}
-	if req.Header.Get("Authorization") != "Bearer secret-token" {
-		t.Fatal("original authorization header mutated")
-	}
-	if got.RemoteAddr != "" {
-		t.Fatalf("remote %s", got.RemoteAddr)
-	}
-	if req.URL.Path != "/peers/secret-key" || req.RemoteAddr != "198.51.100.10:9999" {
-		t.Fatal("original request mutated")
-	}
-
-	idReq := httptest.NewRequest(http.MethodGet, "/requests/secret-id", nil)
-	idReq.SetPathValue("id", "secret-id")
-	idGot := ScrubForTrace(idReq, "GET /requests/{id}")
-	if idGot.URL.Path != "/requests/{id}" {
-		t.Fatalf("id path %s", idGot.URL.Path)
-	}
-	if idGot.PathValue("id") != "secret-id" {
-		t.Fatalf("id value %s", idGot.PathValue("id"))
 	}
 }
 

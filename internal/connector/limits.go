@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -272,24 +271,4 @@ func ParseLimitConfig(lookup func(string) (string, bool)) (Config, error) {
 		it.apply(n)
 	}
 	return cfg, nil
-}
-
-// ScrubForTrace copies a request for the tracer.
-// The copy's path is the route template. The query and path values stay.
-func ScrubForTrace(r *http.Request, pattern string) *http.Request {
-	clone := r.Clone(r.Context())
-	path := pattern
-	if i := strings.IndexByte(pattern, ' '); i >= 0 {
-		path = pattern[i+1:]
-	}
-	if clone.URL != nil {
-		clone.URL.Path = path
-	}
-	if clone.Header != nil {
-		clone.Header.Del("X-Forwarded-For")
-		clone.Header.Del("Forwarded")
-		clone.Header.Del("Authorization")
-	}
-	clone.RemoteAddr = ""
-	return clone
 }

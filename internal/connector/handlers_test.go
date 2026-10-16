@@ -16,6 +16,10 @@ import (
 	"time"
 
 	"github.com/Aryagorjipour/surface/internal/session"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func testStore(t *testing.T) *Store {
@@ -1493,6 +1497,218 @@ func TestLivenessExactBoundary(t *testing.T) {
 	}
 	rec = postMux(mux, "/connect", connectJSON("live-caller", busy, "203.0.113.91:91"))
 	requirePhrase(t, rec, http.StatusConflict, "target not connectable")
+}
+
+func TestActionSpans(t *testing.T) {
+	rec := installSpanRecorder(t)
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	const (
+		key   = "canary-peer-key"
+		addr  = "203.0.113.10:9001"
+		token = "canary-token"
+	)
+	h.SetBearer(token)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	before := 0
+	step := func(pattern string, status int, got *httptest.ResponseRecorder) {
+		t.Helper()
+		if got.Code != status {
+			t.Fatalf("%s status %d body %s", pattern, got.Code, got.Body.String())
+		}
+		ended := rec.Ended()
+		if len(ended) != before+1 {
+			t.Fatalf("%s produced %d new spans", pattern, len(ended)-before)
+		}
+		assertActionSpan(t, ended[len(ended)-1], pattern, status)
+		before = len(ended)
+	}
+
+	step("POST /peers", http.StatusOK, callMuxToken(mux, http.MethodPost, "/peers", peerJSON(key, addr, "available"), "", token))
+	step("GET /peers/{key}", http.StatusOK, callMuxToken(mux, http.MethodGet, "/peers/"+key, "", "", token))
+	connected := callMuxToken(mux, http.MethodPost, "/connect", connectJSON("carol", key, addr), "", token)
+	step("POST /connect", http.StatusCreated, connected)
+	var created struct {
+		ID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(connected.Body.Bytes(), &created); err != nil || created.ID == "" {
+		t.Fatalf("connect body %s", connected.Body.String())
+	}
+	step("GET /pending", http.StatusOK, callMuxToken(mux, http.MethodGet, "/pending?key="+key, "", "", token))
+	step("POST /requests/{id}/accept", http.StatusOK, callMuxToken(mux, http.MethodPost, "/requests/"+created.ID+"/accept", "", "", token))
+	step("POST /requests/{id}/reject", http.StatusOK, callMuxToken(mux, http.MethodPost, "/requests/"+created.ID+"/reject", "", "", token))
+	step("GET /requests/{id}", http.StatusOK, callMuxToken(mux, http.MethodGet, "/requests/"+created.ID, "", "", token))
+
+	unauthorized := callMuxToken(mux, http.MethodPost, "/peers", peerJSON(key, addr, "available"), "192.0.2.20:20", "")
+	requirePhrase(t, unauthorized, http.StatusUnauthorized, "unauthorized")
+	step("POST /peers", http.StatusUnauthorized, unauthorized)
+
+	limited := testStore(t)
+	h2 := newTestHandlers(limited, nil, slog.New(slog.DiscardHandler))
+	h2.SetBearer(token)
+	cfg := DefaultConfig()
+	cfg.SourceAllowance = 1
+	h2.SetLimits(NewLimits(cfg))
+	mux2 := http.NewServeMux()
+	h2.Register(mux2)
+	filled := callMuxToken(mux2, http.MethodPost, "/peers", peerJSON("other-key", "127.0.0.1:1", "available"), "198.51.100.9:9", token)
+	if filled.Code != http.StatusOK {
+		t.Fatalf("allowance fill %d %s", filled.Code, filled.Body.String())
+	}
+	before = len(rec.Ended())
+	denied := callMuxToken(mux2, http.MethodPost, "/peers", peerJSON(key, addr, "available"), "198.51.100.9:9", token)
+	requirePhrase(t, denied, http.StatusTooManyRequests, "too many requests")
+	step("POST /peers", http.StatusTooManyRequests, denied)
+
+	for _, sp := range rec.Ended() {
+		text := sp.Name()
+		for _, attr := range sp.Attributes() {
+			text += " " + string(attr.Key) + "=" + attr.Value.String()
+		}
+		for _, secret := range []string{key, addr, token, "surface-round-trip"} {
+			if strings.Contains(text, secret) {
+				t.Fatalf("span included %q: %s", secret, text)
+			}
+		}
+	}
+}
+
+func TestHealth(t *testing.T) {
+	rec := installSpanRecorder(t)
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.RemoteAddr = "192.0.2.20:20"
+	got := httptest.NewRecorder()
+	mux.ServeHTTP(got, req)
+	if got.Code != http.StatusOK || got.Body.String() != "ok\n" {
+		t.Fatalf("health %d %q", got.Code, got.Body.String())
+	}
+	missing := callMux(mux, http.MethodGet, "/peers/canary-peer-key", "", "192.0.2.21:21")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("health created a peer %d %s", missing.Code, missing.Body.String())
+	}
+
+	before := len(rec.Ended())
+	queried := httptest.NewRequest(http.MethodGet, "/health?canary-peer-key=1&addr=203.0.113.10:9001", nil)
+	queried.RemoteAddr = "192.0.2.22:22"
+	qrec := httptest.NewRecorder()
+	mux.ServeHTTP(qrec, queried)
+	if qrec.Code != http.StatusOK || qrec.Body.String() != "ok\n" {
+		t.Fatalf("query health %d %q", qrec.Code, qrec.Body.String())
+	}
+	ended := rec.Ended()
+	if len(ended) != before+1 {
+		t.Fatalf("health spans %d", len(ended)-before)
+	}
+	assertActionSpan(t, ended[len(ended)-1], "GET /health", http.StatusOK)
+	text := ended[len(ended)-1].Name()
+	for _, attr := range ended[len(ended)-1].Attributes() {
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
+	}
+	for _, secret := range []string{"canary-peer-key", "203.0.113.10:9001"} {
+		if strings.Contains(text, secret) || strings.Contains(qrec.Body.String(), secret) {
+			t.Fatalf("health leaked %q span %s body %q", secret, text, qrec.Body.String())
+		}
+	}
+
+	beforePath := len(rec.Ended())
+	extra := httptest.NewRequest(http.MethodGet, "/health/canary-peer-key?addr=203.0.113.10:9001", nil)
+	extra.RemoteAddr = "192.0.2.24:24"
+	erec := httptest.NewRecorder()
+	mux.ServeHTTP(erec, extra)
+	if erec.Code != http.StatusOK || erec.Body.String() != "ok\n" {
+		t.Fatalf("extra health %d %q", erec.Code, erec.Body.String())
+	}
+	ended = rec.Ended()
+	if len(ended) != beforePath+1 {
+		t.Fatalf("extra health spans %d", len(ended)-beforePath)
+	}
+	assertActionSpan(t, ended[len(ended)-1], "GET /health", http.StatusOK)
+	text = ended[len(ended)-1].Name()
+	for _, attr := range ended[len(ended)-1].Attributes() {
+		text += " " + string(attr.Key) + "=" + attr.Value.String()
+	}
+	for _, secret := range []string{"canary-peer-key", "203.0.113.10:9001"} {
+		if strings.Contains(text, secret) || strings.Contains(erec.Body.String(), secret) {
+			t.Fatalf("extra health leaked %q span %s body %q", secret, text, erec.Body.String())
+		}
+	}
+	stillMissing := callMux(mux, http.MethodGet, "/peers/canary-peer-key", "", "192.0.2.25:25")
+	if stillMissing.Code != http.StatusNotFound {
+		t.Fatalf("extra health created a peer %d %s", stillMissing.Code, stillMissing.Body.String())
+	}
+
+	limited := testStore(t)
+	h2 := newTestHandlers(limited, nil, slog.New(slog.DiscardHandler))
+	cfg := DefaultConfig()
+	cfg.SourceAllowance = 1
+	h2.SetLimits(NewLimits(cfg))
+	mux2 := http.NewServeMux()
+	h2.Register(mux2)
+	filled := callMuxToken(mux2, http.MethodPost, "/peers", peerJSON("other-key", "127.0.0.1:1", "available"), "198.51.100.9:9", testBearer)
+	if filled.Code != http.StatusOK {
+		t.Fatalf("allowance fill %d %s", filled.Code, filled.Body.String())
+	}
+	over := httptest.NewRequest(http.MethodGet, "/health", nil)
+	over.RemoteAddr = "198.51.100.9:9"
+	overRec := httptest.NewRecorder()
+	mux2.ServeHTTP(overRec, over)
+	if overRec.Code != http.StatusOK || overRec.Body.String() != "ok\n" {
+		t.Fatalf("exhausted health %d %q", overRec.Code, overRec.Body.String())
+	}
+
+	unauthorized := callMuxToken(mux, http.MethodPost, "/peers", peerJSON("canary-peer-key", "203.0.113.10:9001", "available"), "192.0.2.23:23", "")
+	requirePhrase(t, unauthorized, http.StatusUnauthorized, "unauthorized")
+}
+
+func installSpanRecorder(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	prev := otel.GetTracerProvider()
+	rec := tracetest.NewSpanRecorder()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)))
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	return rec
+}
+
+func assertActionSpan(t *testing.T, sp sdktrace.ReadOnlySpan, pattern string, status int) {
+	t.Helper()
+	if sp.Name() != pattern {
+		t.Fatalf("span name %q want %q", sp.Name(), pattern)
+	}
+	attrs := sp.Attributes()
+	if len(attrs) != 2 {
+		t.Fatalf("%s attributes %#v", pattern, attrs)
+	}
+	var endpoint string
+	var sawStatus bool
+	for _, attr := range attrs {
+		switch string(attr.Key) {
+		case "endpoint":
+			if attr.Value.Type() != attribute.STRING {
+				t.Fatalf("endpoint type %s", attr.Value.Type())
+			}
+			endpoint = attr.Value.AsString()
+		case "status":
+			if attr.Value.Type() != attribute.INT64 {
+				t.Fatalf("status type %s", attr.Value.Type())
+			}
+			sawStatus = true
+			if attr.Value.AsInt64() != int64(status) {
+				t.Fatalf("status %d want %d", attr.Value.AsInt64(), status)
+			}
+		default:
+			t.Fatalf("unexpected attribute %s", attr.Key)
+		}
+	}
+	if endpoint != pattern || !sawStatus {
+		t.Fatalf("endpoint %q status present %v", endpoint, sawStatus)
+	}
 }
 
 func assertBare(t *testing.T, records []slog.Record, banned ...string) {

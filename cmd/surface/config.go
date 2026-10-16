@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -17,6 +19,8 @@ type surfaceConfig struct {
 	heartbeat time.Duration
 	resume    time.Duration
 	pending   time.Duration
+	relay     string
+	punch     string
 	rest      []string
 }
 
@@ -28,6 +32,10 @@ func surfaceHelp() string {
         resume window (default 60s)
   --pending-poll duration
         pending poll interval (default 2s)
+  --relay address
+        relay address (default unset)
+  --punch address
+        punch address (default the connector host port 8081)
   --config path
         config file (default unset)
   --help
@@ -39,6 +47,8 @@ var surfaceFileKeys = map[string]struct{}{
 	"SURFACE_HEARTBEAT_INTERVAL": {},
 	"SURFACE_RESUME_WINDOW":      {},
 	"SURFACE_PENDING_POLL":       {},
+	"SURFACE_RELAY":              {},
+	"SURFACE_PUNCH":              {},
 	"SURFACE_CONFIG":             {},
 }
 
@@ -67,6 +77,8 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	heartbeat := fs.String("heartbeat-interval", "30s", "heartbeat interval")
 	resume := fs.String("resume-window", "60s", "resume window")
 	pending := fs.String("pending-poll", "2s", "pending poll interval")
+	relayFlag := fs.String("relay", "", "relay address")
+	punchFlag := fs.String("punch", "", "punch address")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
 		return surfaceConfig{}, err
@@ -133,7 +145,37 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	if err != nil {
 		return surfaceConfig{}, err
 	}
-	return surfaceConfig{heartbeat: hb, resume: window, pending: poll, rest: fs.Args()}, nil
+	relay, _ := pickSurface(set["relay"], *relayFlag, lookup, file, "SURFACE_RELAY")
+	punch, punchSet := pickSurface(set["punch"], *punchFlag, lookup, file, "SURFACE_PUNCH")
+	if !punchSet && len(fs.Args()) > 0 {
+		punch = defaultPunch(fs.Args()[0])
+	}
+	return surfaceConfig{heartbeat: hb, resume: window, pending: poll, relay: relay, punch: punch, rest: fs.Args()}, nil
+}
+
+func pickSurface(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string, name string) (string, bool) {
+	if flagSet {
+		return strings.TrimSpace(flagVal), true
+	}
+	if raw, ok := lookup(name); ok {
+		return strings.TrimSpace(raw), true
+	}
+	if raw, ok := file[name]; ok {
+		return strings.TrimSpace(raw), true
+	}
+	return "", false
+}
+
+func defaultPunch(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return ""
+	}
+	return net.JoinHostPort(host, "8081")
 }
 
 func positiveDuration(lookup func(string) (string, bool), name string, fallback time.Duration) (time.Duration, error) {
