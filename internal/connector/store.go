@@ -20,6 +20,38 @@ import (
 type Store struct {
 	db     *sql.DB
 	encKey []byte
+	now    func() time.Time
+	window time.Duration
+}
+
+// SetNow replaces the clock used for last_seen and staleness.
+func (s *Store) SetNow(now func() time.Time) {
+	if s == nil || now == nil {
+		return
+	}
+	s.now = now
+}
+
+// SetSilenceWindow installs the operator window. Open does not choose it.
+func (s *Store) SetSilenceWindow(window time.Duration) {
+	if s == nil {
+		return
+	}
+	s.window = window
+}
+
+func (s *Store) clock() time.Time {
+	if s.now == nil {
+		return time.Now()
+	}
+	return s.now()
+}
+
+func (s *Store) silenceWindow() time.Duration {
+	if s.window > 0 {
+		return s.window
+	}
+	return DefaultExpiryConfig().SilenceWindow
 }
 
 func Open(ctx context.Context, url, token string, encKey []byte) (*Store, error) {
@@ -97,8 +129,41 @@ func (s *Store) UpsertPeer(ctx context.Context, key, address, state string) erro
 		state = excluded.state,
 		last_seen = excluded.last_seen;`
 
-	_, err = s.db.ExecContext(ctx, q, key, ct, nonce, state, time.Now().Unix())
+	_, err = s.db.ExecContext(ctx, q, key, ct, nonce, state, s.clock().Unix())
 	return err
+}
+
+// Prune deletes peers whose last_seen is strictly older than now-window.
+// It returns the deleted keys. It does not decrypt addresses and it does not log keys.
+func (s *Store) Prune(ctx context.Context, now time.Time, window time.Duration) ([]string, error) {
+	cutoff := now.Add(-window).Unix()
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM peers WHERE last_seen < ?`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM peers WHERE last_seen < ?`, cutoff); err != nil {
+		return nil, err
+	}
+	return keys, nil
 }
 
 func (s *Store) GetPeer(ctx context.Context, key string) (address, state string, lastSeen time.Time, err error) {
@@ -111,6 +176,12 @@ func (s *Store) GetPeer(ctx context.Context, key string) (address, state string,
 	}
 	if err != nil {
 		return "", "", time.Time{}, err
+	}
+	if PeerStale(ts, s.clock(), s.silenceWindow()) {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM peers WHERE key = ?`, key); err != nil {
+			return "", "", time.Time{}, err
+		}
+		return "", "", time.Time{}, fmt.Errorf("peer not found")
 	}
 
 	address, err = decrypt(s.encKey, ct, nonce)
