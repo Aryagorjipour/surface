@@ -1364,6 +1364,8 @@ func TestAcceptReturnsAdmissionProof(t *testing.T) {
 
 	kept := "kept-proof-value"
 	now := time.Date(2026, 10, 16, 18, 0, 0, 0, time.UTC)
+	// The deadline is compared with the handler clock, not the wall clock.
+	h.SetNow(func() time.Time { return now })
 	h.applyStored([]storedRequest{{
 		ConnectRequest: ConnectRequest{
 			ID: "stored-accepted", FromKey: caller, FromAddress: addr, ToKey: target,
