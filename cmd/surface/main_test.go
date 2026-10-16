@@ -14,6 +14,24 @@ import (
 	"time"
 )
 
+// lockedBuffer lets a test read slog output while a heartbeat goroutine writes it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
 func TestSurfaceHelp(t *testing.T) {
 	text := surfaceHelp()
 	for _, want := range []string{
@@ -152,7 +170,7 @@ func TestLogsOmitKeyAndAddress(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	var buf bytes.Buffer
+	var buf lockedBuffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
 	err := run([]string{srv.URL, key, addr}, func(k string) (string, bool) {
 		if k == "SURFACE_CONNECTOR_TOKEN" {
@@ -177,9 +195,14 @@ func TestLogsOmitKeyAndAddress(t *testing.T) {
 		ctx:        ctx,
 		presence:   "available",
 	}
-	go a.heartbeatLoop()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.heartbeatLoop()
+	}()
 	time.Sleep(60 * time.Millisecond)
 	cancel()
+	<-done
 
 	text := buf.String()
 	if !strings.Contains(text, "registered") || !strings.Contains(text, "heartbeat") {

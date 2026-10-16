@@ -28,7 +28,9 @@ func main() {
 func run(args []string, lookup func(string) (string, bool), logger *slog.Logger, listen func(*http.Server) error) error {
 	op, err := connector.ParseOperator(args, lookup)
 	if errors.Is(err, connector.ErrHelp) {
-		fmt.Fprint(os.Stdout, connector.ConnectorHelp())
+		if _, err := fmt.Fprint(os.Stdout, connector.ConnectorHelp()); err != nil {
+			return err
+		}
 		return nil
 	}
 	if err != nil {

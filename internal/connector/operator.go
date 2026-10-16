@@ -282,13 +282,13 @@ func mergedValue(name string, set map[string]bool, flagVal string, lookup func(s
 		}
 	}
 	emptyUnset := name != "SURFACE_CACHE_ADDR"
-	if flagName != "" && set[flagName] && !(emptyUnset && flagVal == "") {
+	if flagName != "" && set[flagName] && (!emptyUnset || flagVal != "") {
 		return flagVal, true
 	}
-	if raw, ok := lookup(name); ok && !(emptyUnset && raw == "") {
+	if raw, ok := lookup(name); ok && (!emptyUnset || raw != "") {
 		return raw, true
 	}
-	if raw, ok := file[name]; ok && !(emptyUnset && raw == "") {
+	if raw, ok := file[name]; ok && (!emptyUnset || raw != "") {
 		return raw, true
 	}
 	return "", false
@@ -297,13 +297,13 @@ func mergedValue(name string, set map[string]bool, flagVal string, lookup func(s
 // pick resolves one string setting. emptyUnset treats "" as missing so a file value can show through.
 // Cache address keeps an explicit empty string, which disables Redis.
 func pick(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string, envName, fallback string, emptyUnset bool) (string, bool) {
-	if flagSet && !(emptyUnset && flagVal == "") {
+	if flagSet && (!emptyUnset || flagVal != "") {
 		return flagVal, true
 	}
-	if raw, ok := lookup(envName); ok && !(emptyUnset && raw == "") {
+	if raw, ok := lookup(envName); ok && (!emptyUnset || raw != "") {
 		return raw, true
 	}
-	if raw, ok := file[envName]; ok && !(emptyUnset && raw == "") {
+	if raw, ok := file[envName]; ok && (!emptyUnset || raw != "") {
 		return raw, true
 	}
 	if fallback != "" || !emptyUnset {
