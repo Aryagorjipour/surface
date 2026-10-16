@@ -85,6 +85,10 @@ func run(lookup func(string) (string, bool), logger *slog.Logger, listen func(*h
 		dropPrunedPeerCache(ctx, cache, logger, keys)
 	}
 
+	loadCtx, loadCancel := context.WithTimeout(ctx, 2*time.Second)
+	_ = h.LoadRequests(loadCtx)
+	loadCancel()
+
 	pruneCtx, pruneCancel := context.WithCancel(context.Background())
 	waitPrune := h.StartPrune(pruneCtx, time.Second)
 

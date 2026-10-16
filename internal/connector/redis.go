@@ -3,7 +3,9 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -82,12 +84,18 @@ func (r *RedisCache) DelPeer(ctx context.Context, key string) error {
 	return r.client.Del(ctx, "peer:"+key).Err()
 }
 
+// storedRequest is the Redis body. expires_at stays out of the HTTP body.
+type storedRequest struct {
+	ConnectRequest
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+}
+
 // Pending requests
 func (r *RedisCache) SetRequest(ctx context.Context, cr *ConnectRequest, ttl time.Duration) error {
 	if r == nil {
 		return nil
 	}
-	b, err := json.Marshal(cr)
+	b, err := json.Marshal(storedRequest{ConnectRequest: *cr, ExpiresAt: cr.expiresAt})
 	if err != nil {
 		return err
 	}
@@ -107,24 +115,84 @@ func (r *RedisCache) GetRequest(ctx context.Context, id string) (*ConnectRequest
 	if err != nil {
 		return nil, err
 	}
-	var cr ConnectRequest
-	if err := json.Unmarshal(b, &cr); err != nil {
+	var stored storedRequest
+	if err := json.Unmarshal(b, &stored); err != nil {
 		return nil, err
 	}
+	cr := stored.ConnectRequest
+	cr.expiresAt = stored.ExpiresAt
 	return &cr, nil
 }
 
-func (r *RedisCache) UpdateRequestStatus(ctx context.Context, id, status string, ttl time.Duration) error {
-	if r == nil {
+// fetchStored reads every pending set. A body that does not parse is counted
+// and left in place. Any other error aborts the fill.
+func (r *RedisCache) fetchStored(ctx context.Context) ([]storedRequest, int, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	if r == nil || r.client == nil {
+		return nil, 0, nil
+	}
+	var records []storedRequest
+	var skipped int
+	var cursor uint64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
+		keys, next, err := r.client.Scan(ctx, cursor, "pending:*", 100).Result()
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, key := range keys {
+			toKey := strings.TrimPrefix(key, "pending:")
+			ids, err := r.PendingIDs(ctx, toKey)
+			if err != nil {
+				return nil, 0, err
+			}
+			for _, id := range ids {
+				cr, err := r.GetRequest(ctx, id)
+				if err == nil {
+					records = append(records, storedRequest{ConnectRequest: *cr, ExpiresAt: cr.expiresAt})
+					continue
+				}
+				if errors.Is(err, redis.Nil) {
+					continue
+				}
+				if badRequestBody(err) {
+					skipped++
+					continue
+				}
+				return nil, 0, err
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return records, skipped, nil
+}
+
+func badRequestBody(err error) bool {
+	var syntax *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	return errors.As(err, &syntax) || errors.As(err, &typeErr)
+}
+
+// DelRequest removes the request body and its pending-set membership.
+// A nil cache returns nil.
+func (r *RedisCache) DelRequest(ctx context.Context, id, toKey string) error {
+	if r == nil || r.client == nil {
 		return nil
 	}
-	cr, err := r.GetRequest(ctx, id)
-	if err != nil {
-		return err
+	pipe := r.client.Pipeline()
+	pipe.Del(ctx, "req:"+id)
+	if toKey != "" {
+		pipe.SRem(ctx, "pending:"+toKey, id)
 	}
-	cr.Status = status
-	b, _ := json.Marshal(cr)
-	return r.client.Set(ctx, "req:"+id, b, ttl).Err()
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 // PendingIDs returns ids whose req key still exists and removes the rest from the set.

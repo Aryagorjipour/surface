@@ -914,3 +914,360 @@ func requirePhrase(t *testing.T, rec *httptest.ResponseRecorder, status int, wan
 		t.Fatalf("status %d body %q, want %d %q", rec.Code, got, status, want)
 	}
 }
+
+func TestRestoreLoadedRequest(t *testing.T) {
+	store := testStore(t)
+	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	now := time.Date(2026, 10, 16, 15, 0, 0, 0, time.UTC)
+	h.SetNow(func() time.Time { return now })
+	h.SetLifetime(10 * time.Minute)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		idA   = "restore-a"
+		idB   = "restore-b"
+		addrA = "203.0.113.10:10"
+	)
+	deadline := now.Add(10 * time.Minute)
+	h.applyStored([]storedRequest{
+		{
+			ConnectRequest: ConnectRequest{
+				ID: idA, FromKey: "caller-a", FromAddress: addrA,
+				ToKey: "target-a", Status: "pending", Created: now,
+			},
+			ExpiresAt: deadline,
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: idB, FromKey: "caller-b", FromAddress: "203.0.113.11:11",
+				ToKey: "target-b", Status: "pending", Created: now,
+			},
+			ExpiresAt: deadline,
+		},
+	})
+
+	rec := getReq(mux, "/pending?key=target-a", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending %d %s", rec.Code, rec.Body.String())
+	}
+	body := strings.TrimRight(rec.Body.String(), "\n")
+	for _, want := range []string{
+		`"request_id":"` + idA + `"`,
+		`"from_key":"caller-a"`,
+		`"from_address":"` + addrA + `"`,
+		`"to_key":"target-a"`,
+		`"status":"pending"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("pending body %s missing %s", body, want)
+		}
+	}
+	if strings.Contains(body, idB) {
+		t.Fatalf("pending body included the other target: %s", body)
+	}
+	if strings.Contains(body, "expires_at") {
+		t.Fatalf("pending body contains expires_at: %s", body)
+	}
+
+	rec = getReq(mux, "/requests/"+idA, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+	}
+	statusBody := strings.TrimRight(rec.Body.String(), "\n")
+	for _, want := range []string{
+		`"request_id":"` + idA + `"`,
+		`"from_key":"caller-a"`,
+		`"from_address":"` + addrA + `"`,
+		`"to_key":"target-a"`,
+		`"status":"pending"`,
+	} {
+		if !strings.Contains(statusBody, want) {
+			t.Fatalf("status body %s missing %s", statusBody, want)
+		}
+	}
+	if strings.Contains(statusBody, "expires_at") {
+		t.Fatalf("status body contains expires_at: %s", statusBody)
+	}
+}
+
+func TestRestoreDecision(t *testing.T) {
+	store := testStore(t)
+	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	now := time.Date(2026, 10, 16, 17, 0, 0, 0, time.UTC)
+	h.SetNow(func() time.Time { return now })
+	const life = 10 * time.Minute
+	h.SetLifetime(life)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	acceptedAt := now.Add(2 * time.Hour)
+	rejectedAt := now.Add(3 * time.Hour)
+	created := now.Add(-time.Minute)
+	h.applyStored([]storedRequest{
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "acc-id", FromKey: "caller-a", FromAddress: "203.0.113.10:10",
+				ToKey: "target-a", Status: "accepted", Created: created,
+			},
+			ExpiresAt: acceptedAt,
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "rej-id", FromKey: "caller-b", FromAddress: "203.0.113.11:11",
+				ToKey: "target-a", Status: "rejected", Created: created,
+			},
+			ExpiresAt: rejectedAt,
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "past-id", FromKey: "caller-c", FromAddress: "203.0.113.12:12",
+				ToKey: "target-a", Status: "pending", Created: created,
+			},
+			ExpiresAt: now.Add(-time.Nanosecond),
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "acc-zero", FromKey: "caller-d", FromAddress: "203.0.113.13:13",
+				ToKey: "target-a", Status: "accepted", Created: created,
+			},
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "rej-zero", FromKey: "caller-e", FromAddress: "203.0.113.14:14",
+				ToKey: "target-a", Status: "rejected", Created: created,
+			},
+		},
+		{
+			ConnectRequest: ConnectRequest{
+				ID: "legacy-id", FromKey: "caller-f", FromAddress: "203.0.113.15:15",
+				ToKey: "target-b", Status: "pending", Created: created,
+			},
+		},
+	})
+
+	rec := getReq(mux, "/requests/acc-id", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("accepted status %d %s", rec.Code, rec.Body.String())
+	}
+	acceptedBody := strings.TrimRight(rec.Body.String(), "\n")
+	if !strings.Contains(acceptedBody, `"status":"accepted"`) {
+		t.Fatalf("accepted body %s", acceptedBody)
+	}
+	if strings.Contains(acceptedBody, "expires_at") {
+		t.Fatalf("status body contains expires_at: %s", acceptedBody)
+	}
+	pendingA := strings.TrimRight(getReq(mux, "/pending?key=target-a", "").Body.String(), "\n")
+	if strings.Contains(pendingA, "acc-id") {
+		t.Fatalf("accepted id stayed on the pending list: %s", pendingA)
+	}
+	h.mu.RLock()
+	accepted := h.byID["acc-id"]
+	h.mu.RUnlock()
+	if accepted == nil || !accepted.expiresAt.Equal(acceptedAt) || accepted.expiresAt.Equal(now.Add(life)) {
+		t.Fatalf("accepted deadline = fill time plus lifetime, got %#v", accepted)
+	}
+
+	rec = getReq(mux, "/requests/rej-id", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rejected status %d %s", rec.Code, rec.Body.String())
+	}
+	rejectedBody := strings.TrimRight(rec.Body.String(), "\n")
+	if !strings.Contains(rejectedBody, `"status":"rejected"`) || strings.Contains(rejectedBody, "expires_at") {
+		t.Fatalf("rejected body %s", rejectedBody)
+	}
+	if strings.Contains(pendingA, "rej-id") {
+		t.Fatalf("rejected id stayed on the pending list: %s", pendingA)
+	}
+
+	h.mu.RLock()
+	_, past := h.byID["past-id"]
+	_, accZero := h.byID["acc-zero"]
+	_, rejZero := h.byID["rej-zero"]
+	legacy := h.byID["legacy-id"]
+	h.mu.RUnlock()
+	if past || accZero || rejZero {
+		t.Fatal("a past request or a decision without a deadline was inserted")
+	}
+	if legacy == nil || !legacy.expiresAt.Equal(created.Add(life)) {
+		t.Fatalf("legacy deadline %#v, want %s", legacy, created.Add(life))
+	}
+	rec = getReq(mux, "/requests/legacy-id", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy status %d %s", rec.Code, rec.Body.String())
+	}
+	legacyBody := strings.TrimRight(rec.Body.String(), "\n")
+	if !strings.Contains(legacyBody, `"status":"pending"`) || strings.Contains(legacyBody, "expires_at") {
+		t.Fatalf("legacy body %s", legacyBody)
+	}
+	pendingB := strings.TrimRight(getReq(mux, "/pending?key=target-b", "").Body.String(), "\n")
+	if !strings.Contains(pendingB, "legacy-id") {
+		t.Fatalf("legacy pending body %s", pendingB)
+	}
+}
+
+func TestRestartWithoutStore(t *testing.T) {
+	store := testStore(t)
+	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	rec := postMux(mux, "/peers", peerJSON("target", "203.0.113.1:1", "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	rec = postMux(mux, "/connect", connectJSON("caller", "target", "203.0.113.2:2"))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("connect %d %s", rec.Code, rec.Body.String())
+	}
+	body := strings.TrimRight(rec.Body.String(), "\n")
+	var created struct {
+		ID     string `json:"request_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(body), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID == "" || !strings.Contains(body, `"status":"pending"`) {
+		t.Fatalf("connect body %s", body)
+	}
+	if !pendingHas(pendingBodies(t, mux, "target"), created.ID, "pending") {
+		t.Fatal("pending list omitted the new request")
+	}
+	rec = postMux(mux, "/requests/"+created.ID+"/accept", "")
+	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+
+	h2 := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	if err := h2.LoadRequests(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mux2 := http.NewServeMux()
+	h2.Register(mux2)
+	rec = getReq(mux2, "/pending?key=target", "")
+	requirePhrase(t, rec, http.StatusOK, "[]")
+	for _, target := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/requests/" + created.ID},
+		{http.MethodPost, "/requests/" + created.ID + "/accept"},
+		{http.MethodPost, "/requests/" + created.ID + "/reject"},
+	} {
+		rec = callMux(mux2, target.method, target.path, "", "")
+		requirePhrase(t, rec, http.StatusNotFound, "request not found")
+	}
+}
+
+func TestRestoreLogsBare(t *testing.T) {
+	const (
+		callerAddr = "203.0.113.50:50"
+		callerKey  = "log-caller-key"
+		targetKey  = "log-target-key"
+		requestID  = "log-request-id"
+		secret     = "test-secret-do-not-log"
+	)
+	now := time.Date(2026, 10, 16, 18, 0, 0, 0, time.UTC)
+	const life = 10 * time.Minute
+	readable := storedRequest{
+		ConnectRequest: ConnectRequest{
+			ID: requestID, FromKey: callerKey, FromAddress: callerAddr,
+			ToKey: targetKey, Status: "pending", Created: now,
+		},
+		ExpiresAt: now.Add(life),
+	}
+	skipped := storedRequest{
+		ConnectRequest: ConnectRequest{
+			ID: requestID, FromKey: callerKey, FromAddress: secret,
+			ToKey: targetKey, Status: "accepted", Created: now,
+		},
+	}
+
+	store := testStore(t)
+	restoredLog := &slogCapture{}
+	h := NewHandlers(store, nil, slog.New(restoredLog))
+	h.SetNow(func() time.Time { return now })
+	h.SetLifetime(life)
+	h.applyStored([]storedRequest{readable})
+	if !sawLog(restoredLog.all(), "restored requests", true) {
+		t.Fatal("a readable pending fill did not log restored requests")
+	}
+	if sawLog(restoredLog.all(), "pending restore skipped", false) {
+		t.Fatal("a fill that skipped nothing logged a skip")
+	}
+	assertBare(t, restoredLog.all(), callerAddr, callerKey, targetKey, requestID, secret)
+
+	skipLog := &slogCapture{}
+	h2 := NewHandlers(store, nil, slog.New(skipLog))
+	h2.SetNow(func() time.Time { return now })
+	h2.SetLifetime(life)
+	h2.applyStored([]storedRequest{skipped})
+	if !sawLog(skipLog.all(), "pending restore skipped", true) {
+		t.Fatal("a decision without a deadline did not log a skip")
+	}
+	h2.mu.RLock()
+	_, inserted := h2.byID[requestID]
+	h2.mu.RUnlock()
+	if inserted {
+		t.Fatal("a decision without a deadline was inserted")
+	}
+	assertBare(t, skipLog.all(), callerAddr, callerKey, targetKey, requestID, secret)
+
+	emptyLog := &slogCapture{}
+	h3 := NewHandlers(store, nil, slog.New(emptyLog))
+	h3.SetNow(func() time.Time { return now })
+	h3.applyStored(nil)
+	if sawLog(emptyLog.all(), "restored requests", false) {
+		t.Fatal("a fill of no records logged restored requests")
+	}
+
+	failLog := &slogCapture{}
+	h4 := NewHandlers(store, NewRedis("127.0.0.1:1", secret), slog.New(failLog))
+	h4.mu.Lock()
+	h4.byID = map[string]*ConnectRequest{"seed": {ID: requestID, FromKey: callerKey, FromAddress: callerAddr, ToKey: targetKey}}
+	h4.byToKey = map[string][]string{targetKey: {requestID}}
+	h4.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := h4.LoadRequests(ctx); err == nil {
+		t.Fatal("canceled fill returned nil")
+	}
+	h4.mu.RLock()
+	emptyMaps := len(h4.byID) == 0 && len(h4.byToKey) == 0
+	h4.mu.RUnlock()
+	if !emptyMaps {
+		t.Fatal("failed fill left a partial map")
+	}
+	records := failLog.all()
+	if len(records) != 1 || records[0].Message != "pending store unavailable, continuing without restore" {
+		t.Fatalf("failed fill logs %#v", records)
+	}
+	if records[0].NumAttrs() != 0 {
+		t.Fatalf("failed fill log has attributes")
+	}
+	assertBare(t, records, callerAddr, callerKey, targetKey, requestID, secret)
+}
+
+func sawLog(records []slog.Record, message string, needCount bool) bool {
+	for _, record := range records {
+		if record.Message != message {
+			continue
+		}
+		if needCount && attrInt(record, "count") <= 0 {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func assertBare(t *testing.T, records []slog.Record, banned ...string) {
+	t.Helper()
+	for _, record := range records {
+		text := recordText(record)
+		for _, secret := range banned {
+			if secret != "" && strings.Contains(text, secret) {
+				t.Fatalf("restore log included a private value: %s", text)
+			}
+		}
+	}
+}
