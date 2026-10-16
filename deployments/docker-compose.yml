@@ -48,6 +48,9 @@ services:
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: root
       SURFACE_PUNCH_ADDR: ":8081"
+      # Two Surfaces on this machine share one source. 240 covers their
+      # pending polls, heartbeats, and one accept. The product default stays 60.
+      SURFACE_SOURCE_ALLOWANCE: "240"
     volumes:
       - connector-data:/app/data
     depends_on:
