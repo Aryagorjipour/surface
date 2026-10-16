@@ -4,6 +4,12 @@
 
 ### Added
 
+- `just help` starts the dev Connector, a dev Surface from source, and the stage or production Connector.
+
+### Fixed
+
+- The local stack allows 240 requests per source per minute, so two Surfaces on one machine can poll, connect, and accept. A refused call is reported as `too many requests`.
+- A file-backed connector store keeps one SQLite connection open, so two peers can register together.
 - Connector spans record the route endpoint and the HTTP status.
 - A blocked direct chat prints `traversal failed`.
 - `surface` accepts `--relay` and `--punch`. The connector accepts `--punch`.

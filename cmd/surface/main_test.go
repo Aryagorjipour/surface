@@ -324,3 +324,77 @@ func TestSurfacePathFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestConnectReportsRateLimit(t *testing.T) {
+	prev := acceptPoll
+	acceptPoll = time.Millisecond
+	t.Cleanup(func() { acceptPoll = prev })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/peers/alice":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"key":"alice","address":"127.0.0.1:9001","state":"available"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/connect":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"request_id":"req-1","status":"pending"}`))
+		default:
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+		}
+	}))
+	defer srv.Close()
+
+	a := &app{
+		base:       srv.URL,
+		myKey:      "bob",
+		listenAddr: "127.0.0.1:9002",
+		token:      "dev",
+		ctx:        context.Background(),
+	}
+	err := a.doConnect("alice")
+	if err == nil || err.Error() != "too many requests" {
+		t.Fatalf("connect: %v", err)
+	}
+}
+
+func TestAcceptReportsRateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	a := &app{base: srv.URL, token: "dev", ctx: context.Background()}
+	if _, err := a.postAction("req-1", "accept"); err == nil || err.Error() != "too many requests" {
+		t.Fatalf("accept: %v", err)
+	}
+}
+
+func TestPendingRateLimitIsNotADecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	var buf lockedBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	a := &app{
+		base:        srv.URL,
+		myKey:       "alice",
+		token:       "dev",
+		pendingPoll: 5 * time.Millisecond,
+		logger:      slog.New(slog.NewTextHandler(&buf, nil)),
+		ctx:         ctx,
+	}
+	go a.pollPending()
+	deadline := time.Now().Add(time.Second)
+	for !strings.Contains(buf.String(), "too many requests") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	text := buf.String()
+	if strings.Contains(text, "decode pending") {
+		t.Fatalf("rate limit logged as a decode error: %s", text)
+	}
+	if !strings.Contains(text, "too many requests") {
+		t.Fatalf("log: %s", text)
+	}
+}

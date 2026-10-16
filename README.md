@@ -10,18 +10,12 @@ Peer-to-peer terminal chat with a privacy-first Connector (rendezvous + signalin
 - [SECURITY.md](SECURITY.md)
 - [CHANGELOG.md](CHANGELOG.md)
 
-## Local stack
+## Run
 
-Start the Connector, the cache, and the dev Vault from a fresh clone. The contributor does not edit a file. From `surface/deployments`:
-
-```sh
-docker compose up
-```
-
-When the Connector is listening, register from the host:
+From the repository root, with [just](https://github.com/casey/just) 1.58.0 or newer:
 
 ```sh
-SURFACE_CONNECTOR_TOKEN=dev surface http://127.0.0.1:8080 alice 127.0.0.1:9001
+just help
 ```
 
-The development token, the development encryption key, and the dev Vault root token are for this local stack only.
+`just` prints the same guide. It is the only way to start the dev Connector, a dev Surface, or the stage and production Connector. The dev stack allows 240 requests per source per minute so two Surfaces on one machine can connect. The deployment steps are in [deployments/README.md](deployments/README.md).

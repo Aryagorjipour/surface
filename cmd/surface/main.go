@@ -361,6 +361,20 @@ func (a *app) pollPending() {
 			if err != nil {
 				continue
 			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				a.drain(resp.Body)
+				if a.logger != nil {
+					a.logger.Warn("too many requests")
+				}
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				a.drain(resp.Body)
+				if a.logger != nil {
+					a.logger.Warn("decode pending")
+				}
+				continue
+			}
 			var reqs []map[string]any
 			err = json.NewDecoder(resp.Body).Decode(&reqs)
 			a.drain(resp.Body)
@@ -392,6 +406,9 @@ func (a *app) postAction(id, action string) (string, error) {
 		return "", err
 	}
 	defer a.drain(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", errors.New("too many requests")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
@@ -422,6 +439,12 @@ func (a *app) doConnect(target string) error {
 		return err
 	}
 	defer a.drain(resp.Body)
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return errors.New("too many requests")
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
 	var cr connectResp
 	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
 		return err
@@ -432,6 +455,17 @@ func (a *app) doConnect(target string) error {
 		time.Sleep(acceptPoll)
 		resp, err := a.do(http.MethodGet, a.base+"/requests/"+cr.RequestID, nil)
 		if err != nil {
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			a.drain(resp.Body)
+			return errors.New("too many requests")
+		}
+		if resp.StatusCode != http.StatusOK {
+			a.drain(resp.Body)
+			if a.logger != nil {
+				a.logger.Warn("decode request status")
+			}
 			continue
 		}
 		var status struct {

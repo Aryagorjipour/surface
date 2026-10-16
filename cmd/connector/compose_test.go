@@ -30,6 +30,8 @@ func TestComposeStack(t *testing.T) {
 		"/app/connector --ready",
 		"SURFACE_PUNCH_ADDR",
 		":8081",
+		"SURFACE_SOURCE_ALLOWANCE",
+		"\"240\"",
 		"deployments/Dockerfile.connector",
 	} {
 		if !strings.Contains(text, want) {
