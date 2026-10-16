@@ -2,8 +2,10 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -60,6 +62,33 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 	if addr != "10.0.0.2:9000" || state != "busy" {
 		t.Errorf("update failed: %s %s", addr, state)
+	}
+}
+
+func TestFileStoreConcurrentUpserts(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	errCh := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("peer-%d", i)
+			if err := store.UpsertPeer(ctx, key, "127.0.0.1:9001", "available"); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, _, _, err := store.GetPeer(ctx, fmt.Sprintf("peer-%d", i)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

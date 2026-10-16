@@ -75,6 +75,10 @@ func Open(ctx context.Context, url, token string, encKey []byte) (*Store, error)
 	if err != nil {
 		return nil, fmt.Errorf("open turso: %w", err)
 	}
+	// A file database is one SQLite file. A second connection returns SQLITE_BUSY.
+	if isFile {
+		db.SetMaxOpenConns(1)
+	}
 
 	if err := db.PingContext(ctx); err != nil {
 		if cerr := db.Close(); cerr != nil {
