@@ -2,26 +2,31 @@ package connector
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 type ConnectRequest struct {
-	ID          string    `json:"request_id"`
-	FromKey     string    `json:"from_key"`
-	FromAddress string    `json:"from_address"`
-	ToKey       string    `json:"to_key"`
-	Status      string    `json:"status"`
-	Created     time.Time `json:"created"`
-	expiresAt   time.Time `json:"-"`
+	ID             string    `json:"request_id"`
+	FromKey        string    `json:"from_key"`
+	FromAddress    string    `json:"from_address"`
+	ToKey          string    `json:"to_key"`
+	Status         string    `json:"status"`
+	Created        time.Time `json:"created"`
+	AdmissionProof string    `json:"admission_proof,omitempty"`
+	expiresAt      time.Time `json:"-"`
 }
 
 type Handlers struct {
@@ -36,6 +41,7 @@ type Handlers struct {
 	now        func() time.Time
 	lifetime   time.Duration
 	silence    time.Duration
+	bearer     string
 }
 
 func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
@@ -69,8 +75,16 @@ func (h *Handlers) SetLifetime(d time.Duration) {
 	h.lifetime = d
 }
 
-// SetSilenceWindow installs the silence window on the handlers and the store.
-// Open does not choose the window. Zero keeps the 24-hour default.
+// SetBearer installs the deployment credential checked on every route.
+func (h *Handlers) SetBearer(token string) {
+	if h == nil {
+		return
+	}
+	h.bearer = token
+}
+
+// SetSilenceWindow installs the liveness window on the handlers and the store.
+// Open does not choose the window. Zero keeps the 90-second default.
 func (h *Handlers) SetSilenceWindow(d time.Duration) {
 	h.silence = d
 	if h.store != nil {
@@ -125,8 +139,29 @@ func (h *Handlers) route(mux *http.ServeMux, pattern, op string, fn http.Handler
 			h.reject(w, http.StatusTooManyRequests, op, "too many requests")
 			return
 		}
+		if !bearerOK(h.bearer, r.Header.Get("Authorization")) {
+			h.reject(w, http.StatusUnauthorized, op, "unauthorized")
+			return
+		}
 		traced.ServeHTTP(w, ScrubForTrace(r, pattern))
 	})
+}
+
+// bearerOK accepts only Authorization: Bearer after the source allowance.
+// An empty expected token rejects every route. A missing header is rejected
+// without comparing the token. A present token is compared as SHA-256 digests.
+func bearerOK(expected, header string) bool {
+	if expected == "" {
+		return false
+	}
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return false
+	}
+	presented := header[len(prefix):]
+	sumE := sha256.Sum256([]byte(expected))
+	sumP := sha256.Sum256([]byte(presented))
+	return subtle.ConstantTimeCompare(sumE[:], sumP[:]) == 1
 }
 
 func (h *Handlers) reject(w http.ResponseWriter, status int, op, class string) {
@@ -240,7 +275,7 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state}, seen.Unix(), 30*time.Second)
+	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state}, seen.Unix(), h.silenceWindow())
 
 	h.writeJSON(w, 0, peerResponse{Key: key, Address: addr, State: state})
 }
@@ -366,6 +401,15 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 	}
 	now := h.clock()
 	life := h.requestLifetime()
+	if cr.Status == "pending" && cr.AdmissionProof == "" {
+		_, text, err := session.NewProof()
+		if err != nil {
+			h.mu.Unlock()
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return
+		}
+		cr.AdmissionProof = text
+	}
 	cr.Status = "accepted"
 	cr.expiresAt = RequestDeadline(cr.Created, now, true, life)
 	stored := *cr
@@ -373,7 +417,10 @@ func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
 
 	_ = h.cache.SetRequest(r.Context(), &stored, life)
 
-	h.writeJSON(w, 0, map[string]string{"status": "accepted"})
+	h.writeJSON(w, 0, struct {
+		Status         string `json:"status"`
+		AdmissionProof string `json:"admission_proof,omitempty"`
+	}{Status: "accepted", AdmissionProof: stored.AdmissionProof})
 }
 
 func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {

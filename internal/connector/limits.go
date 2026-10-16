@@ -288,6 +288,7 @@ func ScrubForTrace(r *http.Request, pattern string) *http.Request {
 	if clone.Header != nil {
 		clone.Header.Del("X-Forwarded-For")
 		clone.Header.Del("Forwarded")
+		clone.Header.Del("Authorization")
 	}
 	clone.RemoteAddr = ""
 	return clone

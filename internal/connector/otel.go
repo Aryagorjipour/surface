@@ -13,7 +13,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 )
 
-func InitOTEL(ctx context.Context, service string, logger *slog.Logger) (func(context.Context) error, error) {
+func InitOTEL(ctx context.Context, service string, logger *slog.Logger, endpoint string) (func(context.Context) error, error) {
 	if os.Getenv("OTEL_STDOUT") == "1" {
 		exp, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
 		if err != nil {
@@ -25,7 +25,6 @@ func InitOTEL(ctx context.Context, service string, logger *slog.Logger) (func(co
 		return tp.Shutdown, nil
 	}
 
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if endpoint == "" {
 		logger.Info("otel disabled (set OTEL_EXPORTER_OTLP_ENDPOINT to enable)")
 		// no-op provider — no export attempts

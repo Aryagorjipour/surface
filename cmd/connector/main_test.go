@@ -19,7 +19,7 @@ import (
 func TestRefusedExpirySkipsListen(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	called := false
-	err := run(func(name string) (string, bool) {
+	err := run(nil, func(name string) (string, bool) {
 		if name == "SURFACE_SILENCE_WINDOW" {
 			return "0s", true
 		}
@@ -32,11 +32,50 @@ func TestRefusedExpirySkipsListen(t *testing.T) {
 		t.Fatal("expected startup to be refused")
 	}
 	msg := err.Error()
-	if !strings.Contains(msg, "SURFACE_SILENCE_WINDOW") || !strings.Contains(msg, "not a positive duration") {
+	if !strings.Contains(msg, "SURFACE_SILENCE_WINDOW") || !strings.Contains(msg, "retired") {
 		t.Fatalf("error %q", msg)
 	}
 	if strings.Contains(msg, "0s") {
 		t.Fatalf("error contains the raw value: %q", msg)
+	}
+	if called {
+		t.Fatal("listen was called")
+	}
+}
+
+func TestConnectorHelp(t *testing.T) {
+	text := connector.ConnectorHelp()
+	for _, want := range []string{
+		"--listen", ":8080",
+		"--request-lifetime", "10m",
+		"--heartbeat-interval", "30s",
+		"--maintenance-interval", "1s",
+		"--source-allowance", "60",
+		"--key-allowance",
+		"--max-key-chars", "128",
+		"--max-address-chars", "256",
+		"--max-id-chars", "64",
+		"--max-body-bytes", "8192",
+		"--cache-addr",
+		"--secret-store-addr",
+		"--trace-endpoint",
+		"--config",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("help missing %q\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "connector_token") {
+		t.Fatalf("help listed a secret: %s", text)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	called := false
+	err := run([]string{"--help"}, func(string) (string, bool) { return "", false }, logger, func(*http.Server) error {
+		called = true
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if called {
 		t.Fatal("listen was called")

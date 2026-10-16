@@ -3,6 +3,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Aryagorjipour/surface/internal/session"
 )
 
 func testStore(t *testing.T) *Store {
@@ -35,11 +38,13 @@ func testStore(t *testing.T) *Store {
 func TestUpsertAndGetPeer(t *testing.T) {
 	store := testStore(t)
 	h := &Handlers{store: store}
+	h.SetBearer(testBearer)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	body := `{"key":"alice","address":"127.0.0.1:8765","state":"available"}`
 	req := httptest.NewRequest(http.MethodPost, "/peers", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+testBearer)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -47,6 +52,7 @@ func TestUpsertAndGetPeer(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/peers/alice", nil)
+	req.Header.Set("Authorization", "Bearer "+testBearer)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -65,10 +71,12 @@ func TestUpsertAndGetPeer(t *testing.T) {
 func TestGetPeerNotFound(t *testing.T) {
 	store := testStore(t)
 	h := &Handlers{store: store}
+	h.SetBearer(testBearer)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	req := httptest.NewRequest(http.MethodGet, "/peers/missing", nil)
+	req.Header.Set("Authorization", "Bearer "+testBearer)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
@@ -78,7 +86,7 @@ func TestGetPeerNotFound(t *testing.T) {
 
 func TestRejectMalformed(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := newTestHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -106,6 +114,7 @@ func TestRejectMalformed(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), DefaultConfig().MaxBodyBytes+100)
 	counter := &countReader{r: bytes.NewReader(payload)}
 	req := httptest.NewRequest(http.MethodPost, "/peers", counter)
+	req.Header.Set("Authorization", "Bearer "+testBearer)
 	rec = httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	requirePhrase(t, rec, http.StatusBadRequest, "request too large")
@@ -190,7 +199,7 @@ func TestRejectMalformed(t *testing.T) {
 
 func TestConnectBusyStaysConflict(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := newTestHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -209,7 +218,7 @@ func TestConnectBusyStaysConflict(t *testing.T) {
 
 func TestSourceAllowanceHTTP(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := newTestHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	cfg := DefaultConfig()
 	cfg.SourceAllowance = 2
 	cfg.KeyAllowance = 100
@@ -250,7 +259,7 @@ func TestSourceAllowanceHTTP(t *testing.T) {
 func TestRejectionLogBare(t *testing.T) {
 	store := testStore(t)
 	cap := &slogCapture{}
-	h := NewHandlers(store, nil, slog.New(cap))
+	h := newTestHandlers(store, nil, slog.New(cap))
 	cfg := DefaultConfig()
 	cfg.SourceAllowance = 1
 	lim := NewLimits(cfg)
@@ -302,7 +311,7 @@ func TestRejectionLogBare(t *testing.T) {
 				t.Fatalf("nil logger panicked: %v", recovered)
 			}
 		}()
-		bare := NewHandlers(store, nil, nil)
+		bare := newTestHandlers(store, nil, nil)
 		bareMux := http.NewServeMux()
 		bare.Register(bareMux)
 		rec := postMux(bareMux, "/peers", "{")
@@ -312,7 +321,7 @@ func TestRejectionLogBare(t *testing.T) {
 
 func TestKeyAllowanceHTTP(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := newTestHandlers(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	cfg := DefaultConfig()
 	cfg.KeyAllowance = 2
 	cfg.SourceAllowance = 100
@@ -393,12 +402,13 @@ func TestKeyAllowanceHTTP(t *testing.T) {
 
 func TestPendingExpires(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	var now time.Time
 	now = time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
 	const life = 5 * time.Second
 	h.SetLifetime(life)
+	h.SetSilenceWindow(24 * time.Hour)
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -447,7 +457,7 @@ func TestPendingExpires(t *testing.T) {
 	idC := mustConnect(t, mux, "caller", "target", "203.0.113.2:2")
 	now = now.Add(time.Second)
 	rec = postMux(mux, "/requests/"+idC+"/accept", "")
-	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+	requireAccepted(t, rec)
 	if pendingHas(pendingBodies(t, mux, "target"), idC, "pending") {
 		t.Fatal("accepted request stayed on the pending list")
 	}
@@ -499,7 +509,7 @@ func TestPendingExpires(t *testing.T) {
 
 func TestStalePeerNotFound(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	var now time.Time
 	now = time.Date(2026, 10, 16, 9, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
@@ -602,7 +612,7 @@ func TestStalePeerNotFound(t *testing.T) {
 
 func TestFreshConnectStillWorks(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -627,7 +637,7 @@ func TestFreshConnectStillWorks(t *testing.T) {
 		t.Fatalf("created %+v", created)
 	}
 	rec = postMux(mux, "/requests/"+created.ID+"/accept", "")
-	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+	requireAccepted(t, rec)
 	for _, key := range []string{"fresh-a", "fresh-b"} {
 		rec = getReq(mux, "/peers/"+key, "")
 		if rec.Code != http.StatusOK {
@@ -645,22 +655,18 @@ func TestFreshConnectStillWorks(t *testing.T) {
 
 func TestOperatorDurations(t *testing.T) {
 	cfg, err := ParseExpiryConfig(func(name string) (string, bool) {
-		switch name {
-		case "SURFACE_REQUEST_LIFETIME":
+		if name == "SURFACE_REQUEST_LIFETIME" {
 			return "2s", true
-		case "SURFACE_SILENCE_WINDOW":
-			return "3s", true
-		default:
-			return "", false
 		}
+		return "", false
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	h.SetLifetime(cfg.RequestLifetime)
-	h.SetSilenceWindow(cfg.SilenceWindow)
+	h.SetSilenceWindow(3 * time.Second)
 	var now time.Time
 	now = time.Date(2026, 10, 16, 10, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
@@ -684,7 +690,7 @@ func TestOperatorDurations(t *testing.T) {
 func TestExpiryLogsBare(t *testing.T) {
 	store := testStore(t)
 	capture := &slogCapture{}
-	h := NewHandlers(store, nil, slog.New(capture))
+	h := newTestHandlers(store, nil, slog.New(capture))
 	var now time.Time
 	now = time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
@@ -893,7 +899,19 @@ func getReq(mux *http.ServeMux, target, addr string) *httptest.ResponseRecorder 
 	return callMux(mux, http.MethodGet, target, "", addr)
 }
 
+const testBearer = "surface-test-bearer"
+
+func newTestHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
+	h := NewHandlers(store, cache, logger)
+	h.SetBearer(testBearer)
+	return h
+}
+
 func callMux(mux *http.ServeMux, method, target, body, addr string) *httptest.ResponseRecorder {
+	return callMuxToken(mux, method, target, body, addr, testBearer)
+}
+
+func callMuxToken(mux *http.ServeMux, method, target, body, addr, token string) *httptest.ResponseRecorder {
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
@@ -902,9 +920,30 @@ func callMux(mux *http.ServeMux, method, target, body, addr string) *httptest.Re
 	if addr != "" {
 		req.RemoteAddr = addr
 	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	return rec
+}
+
+func requireAccepted(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Status string `json:"status"`
+		Proof  string `json:"admission_proof"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "accepted" || body.Proof == "" {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+	return body.Proof
 }
 
 func requirePhrase(t *testing.T, rec *httptest.ResponseRecorder, status int, want string) {
@@ -917,7 +956,7 @@ func requirePhrase(t *testing.T, rec *httptest.ResponseRecorder, status int, wan
 
 func TestRestoreLoadedRequest(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	now := time.Date(2026, 10, 16, 15, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
 	h.SetLifetime(10 * time.Minute)
@@ -993,7 +1032,7 @@ func TestRestoreLoadedRequest(t *testing.T) {
 
 func TestRestoreDecision(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	now := time.Date(2026, 10, 16, 17, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
 	const life = 10 * time.Minute
@@ -1108,7 +1147,7 @@ func TestRestoreDecision(t *testing.T) {
 
 func TestRestartWithoutStore(t *testing.T) {
 	store := testStore(t)
-	h := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
@@ -1135,9 +1174,9 @@ func TestRestartWithoutStore(t *testing.T) {
 		t.Fatal("pending list omitted the new request")
 	}
 	rec = postMux(mux, "/requests/"+created.ID+"/accept", "")
-	requirePhrase(t, rec, http.StatusOK, `{"status":"accepted"}`)
+	requireAccepted(t, rec)
 
-	h2 := NewHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h2 := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	if err := h2.LoadRequests(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1184,7 +1223,7 @@ func TestRestoreLogsBare(t *testing.T) {
 
 	store := testStore(t)
 	restoredLog := &slogCapture{}
-	h := NewHandlers(store, nil, slog.New(restoredLog))
+	h := newTestHandlers(store, nil, slog.New(restoredLog))
 	h.SetNow(func() time.Time { return now })
 	h.SetLifetime(life)
 	h.applyStored([]storedRequest{readable})
@@ -1258,6 +1297,202 @@ func sawLog(records []slog.Record, message string, needCount bool) bool {
 		return true
 	}
 	return false
+}
+
+func TestAcceptReturnsAdmissionProof(t *testing.T) {
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		caller = "proof-caller"
+		target = "proof-target"
+		addr   = "203.0.113.40:40"
+	)
+	rec := postMux(mux, "/peers", peerJSON(target, "203.0.113.41:41", "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	rec = postMux(mux, "/peers", peerJSON(caller, addr, "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
+	id := mustConnect(t, mux, caller, target, addr)
+
+	rec = getReq(mux, "/requests/"+id, "")
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "admission_proof") || strings.Contains(rec.Body.String(), "expires_at") {
+		t.Fatalf("pending status %d %s", rec.Code, rec.Body.String())
+	}
+	pending := getReq(mux, "/pending?key="+target, "")
+	if strings.Contains(pending.Body.String(), "admission_proof") {
+		t.Fatalf("pending listed a proof: %s", pending.Body.String())
+	}
+	lookup := getReq(mux, "/peers/"+target, "")
+	if lookup.Code != http.StatusOK || strings.Contains(lookup.Body.String(), "admission_proof") || strings.Contains(lookup.Body.String(), "last_seen") {
+		t.Fatalf("lookup %d %s", lookup.Code, lookup.Body.String())
+	}
+
+	rec = postMux(mux, "/requests/"+id+"/accept", "")
+	proof := requireAccepted(t, rec)
+	raw, err := base64.StdEncoding.DecodeString(proof)
+	if err != nil || len(raw) != session.ProofBytes {
+		t.Fatalf("proof %q err %v len %d", proof, err, len(raw))
+	}
+	rec = getReq(mux, "/requests/"+id, "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), proof) || strings.Contains(rec.Body.String(), "expires_at") {
+		t.Fatalf("accepted status %s", rec.Body.String())
+	}
+	again := getReq(mux, "/requests/"+id, "")
+	if !strings.Contains(again.Body.String(), proof) {
+		t.Fatalf("second status changed the proof: %s", again.Body.String())
+	}
+	if strings.Contains(getReq(mux, "/pending?key="+target, "").Body.String(), "admission_proof") {
+		t.Fatal("accepted proof appeared on the pending list")
+	}
+
+	rejectedID := mustConnect(t, mux, caller, target, addr)
+	rec = postMux(mux, "/requests/"+rejectedID+"/reject", "")
+	requirePhrase(t, rec, http.StatusOK, `{"status":"rejected"}`)
+	if strings.Contains(rec.Body.String(), "admission_proof") {
+		t.Fatalf("reject minted a proof: %s", rec.Body.String())
+	}
+
+	kept := "kept-proof-value"
+	now := time.Date(2026, 10, 16, 18, 0, 0, 0, time.UTC)
+	h.applyStored([]storedRequest{{
+		ConnectRequest: ConnectRequest{
+			ID: "stored-accepted", FromKey: caller, FromAddress: addr, ToKey: target,
+			Status: "accepted", Created: now, AdmissionProof: kept,
+		},
+		ExpiresAt: now.Add(time.Minute),
+	}})
+	rec = getReq(mux, "/requests/stored-accepted", "")
+	if !strings.Contains(rec.Body.String(), kept) || strings.Contains(rec.Body.String(), "expires_at") {
+		t.Fatalf("stored status %s", rec.Body.String())
+	}
+	if strings.Contains(getReq(mux, "/pending?key="+target, "").Body.String(), kept) {
+		t.Fatal("stored proof appeared on the pending list")
+	}
+}
+
+func TestBearerOrder(t *testing.T) {
+	store := testStore(t)
+	capture := &slogCapture{}
+	h := NewHandlers(store, nil, slog.New(capture))
+	h.SetBearer(testBearer)
+	cfg := DefaultConfig()
+	cfg.SourceAllowance = 2
+	cfg.KeyAllowance = 1
+	h.SetLimits(NewLimits(cfg))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		src   = "203.0.113.80:80"
+		key   = "hidden-peer"
+		addr  = "203.0.113.81:81"
+		wrong = "wrong-bearer-value"
+	)
+	longKey := strings.Repeat("k", 129)
+	body := peerJSON(key, addr, "available")
+	rec := callMuxToken(mux, http.MethodPost, "/peers", body, src, "")
+	requirePhrase(t, rec, http.StatusUnauthorized, "unauthorized")
+	if strings.Contains(rec.Body.String(), testBearer) {
+		t.Fatalf("body echoed the token: %s", rec.Body.String())
+	}
+	rec = callMuxToken(mux, http.MethodGet, "/peers/"+key, "", "198.51.100.80:80", testBearer)
+	requirePhrase(t, rec, http.StatusNotFound, "not found")
+
+	rec = callMuxToken(mux, http.MethodPost, "/peers", body, src, "")
+	requirePhrase(t, rec, http.StatusUnauthorized, "unauthorized")
+	rec = callMuxToken(mux, http.MethodPost, "/peers", body, src, "")
+	requirePhrase(t, rec, http.StatusTooManyRequests, "too many requests")
+
+	rec = callMuxToken(mux, http.MethodPost, "/peers", body, "198.51.100.81:81", wrong)
+	requirePhrase(t, rec, http.StatusUnauthorized, "unauthorized")
+	if strings.Contains(rec.Body.String(), wrong) || strings.Contains(rec.Body.String(), testBearer) {
+		t.Fatalf("body echoed a token: %s", rec.Body.String())
+	}
+
+	rec = callMuxToken(mux, http.MethodPost, "/peers", peerJSON(longKey, addr, "available"), "198.51.100.82:82", testBearer)
+	requirePhrase(t, rec, http.StatusBadRequest, "key too long")
+
+	okKey := "allowed-once"
+	rec = callMuxToken(mux, http.MethodPost, "/peers", peerJSON(okKey, addr, "available"), "198.51.100.83:83", testBearer)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	rec = callMuxToken(mux, http.MethodPost, "/peers", peerJSON(okKey, addr, "busy"), "198.51.100.84:84", testBearer)
+	requirePhrase(t, rec, http.StatusTooManyRequests, "too many requests")
+
+	for _, record := range capture.all() {
+		text := recordText(record)
+		if strings.Contains(text, testBearer) || strings.Contains(text, wrong) {
+			t.Fatalf("log contained a token: %s", text)
+		}
+	}
+}
+
+func TestLivenessExactBoundary(t *testing.T) {
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	start := time.Date(2026, 10, 16, 19, 0, 0, 0, time.UTC)
+	now := start
+	h.SetNow(func() time.Time { return now })
+	window := 3 * time.Second
+	h.SetSilenceWindow(window)
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		key  = "live-peer"
+		addr = "203.0.113.90:90"
+	)
+	rec := postMux(mux, "/peers", peerJSON(key, addr, "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	now = start.Add(window)
+	rec = getReq(mux, "/peers/"+key, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exact window %d %s", rec.Code, rec.Body.String())
+	}
+	var body peerResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Key != key || body.Address != addr || body.State != "available" || strings.Contains(rec.Body.String(), "last_seen") {
+		t.Fatalf("lookup %+v %s", body, rec.Body.String())
+	}
+	now = start.Add(window + time.Second)
+	rec = getReq(mux, "/peers/"+key, "")
+	requirePhrase(t, rec, http.StatusNotFound, "not found")
+	rec = postMux(mux, "/connect", connectJSON("live-caller", key, "203.0.113.91:91"))
+	requirePhrase(t, rec, http.StatusNotFound, "target not found")
+	if strings.Contains(getReq(mux, "/pending?key="+key, "").Body.String(), "live-caller") {
+		t.Fatal("a missed peer created a request")
+	}
+
+	now = start.Add(time.Hour)
+	busy := "busy-peer"
+	rec = postMux(mux, "/peers", peerJSON(busy, addr, "busy"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("busy register %d %s", rec.Code, rec.Body.String())
+	}
+	rec = postMux(mux, "/peers", peerJSON(busy, addr, "busy"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("busy refresh %d %s", rec.Code, rec.Body.String())
+	}
+	rec = getReq(mux, "/peers/"+busy, "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.State != "busy" || body.Address != addr {
+		t.Fatalf("busy lookup %+v", body)
+	}
+	rec = postMux(mux, "/connect", connectJSON("live-caller", busy, "203.0.113.91:91"))
+	requirePhrase(t, rec, http.StatusConflict, "target not connectable")
 }
 
 func assertBare(t *testing.T, records []slog.Record, banned ...string) {

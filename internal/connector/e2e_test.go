@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/coder/websocket"
 )
 
@@ -21,7 +22,7 @@ const (
 	e2eCallerKey  = "e2e-caller"
 	e2eCalleeKey  = "e2e-callee"
 	e2eCallerAddr = "127.0.0.1:9"
-	e2ePayload    = "surface-e2e"
+	e2ePayload    = "surface-round-trip"
 	e2eBudget     = 8 * time.Second
 )
 
@@ -31,7 +32,7 @@ func TestE2E(t *testing.T) {
 
 	store := testStore(t)
 	logger := slog.New(slog.DiscardHandler)
-	h := NewHandlers(store, nil, logger)
+	h := newTestHandlers(store, nil, logger)
 	mux := http.NewServeMux()
 	h.Register(mux)
 	connector := httptest.NewServer(mux)
@@ -48,6 +49,8 @@ func TestE2E(t *testing.T) {
 	closeCh := make(chan error, 1)
 	wsErr := make(chan error, 1)
 
+	var proofText string
+	var requestID string
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
@@ -55,26 +58,18 @@ func TestE2E(t *testing.T) {
 			sendErr(wsErr, err)
 			return
 		}
-		typ, data, err := c.Read(ctx)
-		if err != nil {
-			sendErr(wsErr, err)
-			_ = c.Close(websocket.StatusNormalClosure, "")
+		text, bad := readAdmitted(ctx, c, requestID, e2eCallerKey, e2eCalleeKey, proofText)
+		if bad != nil {
+			sendErr(wsErr, bad)
+			_ = c.Close(websocket.StatusPolicyViolation, "")
 			return
 		}
-		if typ != websocket.MessageText {
-			sendErr(wsErr, errors.New("frame type"))
-			_ = c.Close(websocket.StatusNormalClosure, "")
-			return
-		}
-		buf := append([]byte(nil), data...)
 		select {
-		case payloadCh <- buf:
+		case payloadCh <- []byte(text):
 		case <-ctx.Done():
 			_ = c.Close(websocket.StatusNormalClosure, "")
 			return
 		}
-		// Read the payload before either side closes. The library discards
-		// data frames that arrive during the close handshake.
 		_, _, readErr := c.Read(ctx)
 		closeErr := c.Close(websocket.StatusNormalClosure, "")
 		if websocket.CloseStatus(readErr) == websocket.StatusNormalClosure &&
@@ -168,22 +163,26 @@ func TestE2E(t *testing.T) {
 	}
 	var acceptBody struct {
 		Status string `json:"status"`
+		Proof  string `json:"admission_proof"`
 	}
 	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptBody))
-	if acceptBody.Status != "accepted" {
+	if acceptBody.Status != "accepted" || acceptBody.Proof == "" {
 		failE2E(t, "accept", errors.New("status"), redact...)
 	}
+	proofText = acceptBody.Proof
+	requestID = created.ID
 	var accepted struct {
 		Status string `json:"status"`
+		Proof  string `json:"admission_proof"`
 	}
 	step("accept", getJSON(ctx, base+"/requests/"+created.ID, http.StatusOK, &accepted))
-	if accepted.Status != "accepted" {
+	if accepted.Status != "accepted" || accepted.Proof != proofText {
 		failE2E(t, "accept", errors.New("status"), redact...)
 	}
 
 	conn, _, err := websocket.Dial(ctx, "ws://"+looked.Address, nil)
 	step("exchange", err)
-	step("exchange", conn.Write(ctx, websocket.MessageText, []byte(e2ePayload)))
+	step("exchange", writeSealed(ctx, conn, requestID, e2eCallerKey, e2eCalleeKey, proofText, e2ePayload))
 
 	var got []byte
 	select {
@@ -219,7 +218,7 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 
 	store := testStore(t)
 	logger := slog.New(slog.DiscardHandler)
-	h := NewHandlers(store, nil, logger)
+	h := newTestHandlers(store, nil, logger)
 	mux := http.NewServeMux()
 	h.Register(mux)
 	connector := httptest.NewServer(mux)
@@ -234,6 +233,8 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 
 	payloadCh := make(chan []byte, 1)
 	wsErr := make(chan error, 1)
+	var proofText string
+	var requestID string
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
@@ -241,18 +242,13 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 			sendErr(wsErr, err)
 			return
 		}
-		typ, data, err := c.Read(ctx)
-		if err != nil {
-			sendErr(wsErr, err)
-			_ = c.Close(websocket.StatusNormalClosure, "")
+		text, bad := readAdmitted(ctx, c, requestID, "e2e-caller-open", "e2e-callee-open", proofText)
+		if bad != nil {
+			sendErr(wsErr, bad)
+			_ = c.Close(websocket.StatusPolicyViolation, "")
 			return
 		}
-		if typ != websocket.MessageText {
-			sendErr(wsErr, errors.New("frame type"))
-			_ = c.Close(websocket.StatusNormalClosure, "")
-			return
-		}
-		payloadCh <- append([]byte(nil), data...)
+		payloadCh <- []byte(text)
 		_, _, readErr := c.Read(ctx)
 		_ = c.Close(websocket.StatusNormalClosure, "")
 		if websocket.CloseStatus(readErr) != websocket.StatusNormalClosure && readErr != nil && !errors.Is(readErr, net.ErrClosed) {
@@ -310,16 +306,19 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 	}, http.StatusCreated, &created))
 	var acceptBody struct {
 		Status string `json:"status"`
+		Proof  string `json:"admission_proof"`
 	}
 	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptBody))
-	if acceptBody.Status != "accepted" {
+	if acceptBody.Status != "accepted" || acceptBody.Proof == "" {
 		failE2E(t, "accept", errors.New("status"))
 	}
+	proofText = acceptBody.Proof
+	requestID = created.ID
 
 	conn, _, err := websocket.Dial(ctx, "ws://"+looked.Address, nil)
 	step("exchange", err)
 	h.SetNow(func() time.Time { return time.Now().Add(25 * time.Hour) })
-	step("exchange", conn.Write(ctx, websocket.MessageText, []byte(payload)))
+	step("exchange", writeSealed(ctx, conn, requestID, "e2e-caller-open", "e2e-callee-open", proofText, payload))
 
 	var got []byte
 	select {
@@ -336,6 +335,107 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 	if err != nil && !errors.Is(err, net.ErrClosed) && websocket.CloseStatus(err) != websocket.StatusNormalClosure {
 		step("close", err)
 	}
+}
+
+func readAdmitted(ctx context.Context, c *websocket.Conn, requestID, callerKey, targetKey, proofText string) (string, error) {
+	typ, data, err := c.Read(ctx)
+	if err != nil {
+		return "", err
+	}
+	if typ != websocket.MessageBinary {
+		return "", errors.New("frame type")
+	}
+	raw, err := session.DecodeProof(proofText)
+	if err != nil {
+		return "", err
+	}
+	reply, sess, err := session.AcceptOffer(data, requestID, callerKey, targetKey, raw, false)
+	if err != nil {
+		return "", err
+	}
+	if err := c.Write(ctx, websocket.MessageBinary, reply); err != nil {
+		return "", err
+	}
+	typ, frame, err := c.Read(ctx)
+	if err != nil {
+		return "", err
+	}
+	if typ != websocket.MessageBinary {
+		return "", errors.New("frame type")
+	}
+	text, display, err := session.Open(sess, frame)
+	if err != nil || !display {
+		return "", errors.New("open")
+	}
+	if bytes.Contains(frame, []byte(text)) {
+		return "", errors.New("plaintext visible")
+	}
+	typ, other, err := c.Read(ctx)
+	if err != nil {
+		return text, nil
+	}
+	if typ == websocket.MessageBinary {
+		if _, _, openErr := session.Open(sess, other); openErr == nil && bytes.Contains(other, []byte(text)) {
+			return "", errors.New("foreign frame displayed")
+		}
+		if _, _, openErr := session.Open(sess, other); openErr == nil {
+			return "", errors.New("foreign frame opened")
+		}
+	}
+	return text, nil
+}
+
+func writeSealed(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey, proofText, plaintext string) error {
+	raw, err := session.DecodeProof(proofText)
+	if err != nil {
+		return err
+	}
+	offer, st, err := session.Offer(requestID, callerKey, targetKey, raw)
+	if err != nil {
+		return err
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, offer); err != nil {
+		return err
+	}
+	_, reply, err := conn.Read(ctx)
+	if err != nil {
+		return err
+	}
+	sess, err := session.FinishOffer(reply, st)
+	if err != nil {
+		return err
+	}
+	frame, err := session.Seal(sess, plaintext, 0)
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(frame, []byte(plaintext)) {
+		return errors.New("plaintext visible")
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+		return err
+	}
+	otherRaw, _, err := session.NewProof()
+	if err != nil {
+		return err
+	}
+	otherOffer, otherState, err := session.Offer("other-request", "other-caller", "other-target", otherRaw)
+	if err != nil {
+		return err
+	}
+	otherReply, _, err := session.AcceptOffer(otherOffer, "other-request", "other-caller", "other-target", otherRaw, false)
+	if err != nil {
+		return err
+	}
+	otherSess, err := session.FinishOffer(otherReply, otherState)
+	if err != nil {
+		return err
+	}
+	foreign, err := session.Seal(otherSess, "not-the-line", 0)
+	if err != nil {
+		return err
+	}
+	return conn.Write(ctx, websocket.MessageBinary, foreign)
 }
 
 func postJSON(ctx context.Context, url string, in any, want int, out any) error {
@@ -360,6 +460,7 @@ func doJSON(ctx context.Context, method, url string, in any, want int, out any) 
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Authorization", "Bearer "+testBearer)
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

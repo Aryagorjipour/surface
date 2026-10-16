@@ -1,0 +1,203 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/Aryagorjipour/surface/internal/session"
+	"github.com/coder/websocket"
+)
+
+func connectedPrompt(dialer bool) string {
+	if dialer {
+		return "connected — type messages (/quit to leave)"
+	}
+	return ">>> peer connected — type messages (/quit to leave)"
+}
+
+// Gate admits one direct chat and spends each request id once.
+type Gate struct {
+	mu       sync.Mutex
+	live     map[string]*session.Session
+	invites  map[string]invite
+	readable func(requestID string) bool
+}
+
+type invite struct {
+	caller string
+	target string
+	proof  []byte
+}
+
+func (g *Gate) remember(requestID, callerKey, targetKey string, proof []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.invites == nil {
+		g.invites = make(map[string]invite)
+	}
+	g.invites[requestID] = invite{caller: callerKey, target: targetKey, proof: append([]byte(nil), proof...)}
+}
+
+func (g *Gate) session(requestID string) *session.Session {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.live[requestID]
+}
+
+func (g *Gate) dialAdmitted(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
+	msg, st, err := session.Offer(requestID, callerKey, targetKey, proof)
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, msg); err != nil {
+		return nil, err
+	}
+	_, reply, err := conn.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return session.FinishOffer(reply, st)
+}
+
+func (g *Gate) acceptAdmitted(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+	_, msg, err := conn.Read(ctx)
+	if err != nil {
+		return err
+	}
+	return g.finishAdmit(ctx, conn, msg, requestID, callerKey, targetKey, proof, ready)
+}
+
+func (g *Gate) finishAdmit(ctx context.Context, conn *websocket.Conn, msg []byte, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+	g.mu.Lock()
+	_, spent := g.live[requestID]
+	check := g.readable
+	g.mu.Unlock()
+	if check != nil && !check(requestID) {
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return fmt.Errorf("refused")
+	}
+	reply, sess, err := session.AcceptOffer(msg, requestID, callerKey, targetKey, proof, spent)
+	if err != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return err
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, reply); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	if g.live == nil {
+		g.live = make(map[string]*session.Session)
+	}
+	g.live[requestID] = sess
+	g.mu.Unlock()
+	if ready != nil {
+		ready(sess)
+	}
+	return nil
+}
+
+// take reads the first frame. An admission calls ready. A resume does not.
+func (g *Gate) take(ctx context.Context, conn *websocket.Conn, now, deadline time.Time, ready func(*session.Session)) (*session.Session, error) {
+	_, msg, err := conn.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(msg) == 0 {
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return nil, fmt.Errorf("refused")
+	}
+	switch msg[0] {
+	case 0x01:
+		id, caller, err := session.OfferNames(msg)
+		if err != nil {
+			_ = conn.Close(websocket.StatusPolicyViolation, "")
+			return nil, err
+		}
+		g.mu.Lock()
+		inv, ok := g.invites[id]
+		g.mu.Unlock()
+		if !ok || inv.caller != caller {
+			_ = conn.Close(websocket.StatusPolicyViolation, "")
+			return nil, fmt.Errorf("refused")
+		}
+		if err := g.finishAdmit(ctx, conn, msg, id, caller, inv.target, inv.proof, ready); err != nil {
+			return nil, err
+		}
+		return g.session(id), nil
+	case 0x05:
+		id, _, _, _, err := resumeID(msg)
+		if err != nil {
+			_ = conn.Close(websocket.StatusPolicyViolation, "")
+			return nil, err
+		}
+		sess := g.session(id)
+		reply, err := session.AcceptResume(sess, msg, now, deadline)
+		if err != nil {
+			_ = conn.Close(websocket.StatusPolicyViolation, "")
+			return nil, err
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, reply); err != nil {
+			return nil, err
+		}
+		for _, frame := range session.Pending(sess) {
+			if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+				return nil, err
+			}
+		}
+		return sess, nil
+	default:
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return nil, fmt.Errorf("refused")
+	}
+}
+
+func resumeID(msg []byte) (string, uint64, uint64, []byte, error) {
+	return splitResumeLocal(msg)
+}
+
+// pushResume sends a resume offer, accepts the reply, then seals lines in order.
+func pushResume(ctx context.Context, conn *websocket.Conn, sess *session.Session, now, deadline time.Time, lines []string) error {
+	offer, err := session.ResumeOffer(sess)
+	if err != nil {
+		return err
+	}
+	if err := conn.Write(ctx, websocket.MessageBinary, offer); err != nil {
+		return err
+	}
+	_, reply, err := conn.Read(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := session.AcceptResume(sess, reply, now, deadline); err != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return err
+	}
+	for _, frame := range session.Pending(sess) {
+		if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+			return err
+		}
+	}
+	for _, line := range lines {
+		frame, err := session.Seal(sess, line, session.Highest(sess))
+		if err != nil {
+			return err
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitResumeLocal(msg []byte) (string, uint64, uint64, []byte, error) {
+	if len(msg) < 1+2 {
+		return "", 0, 0, nil, fmt.Errorf("refused")
+	}
+	idLen := int(msg[1])<<8 | int(msg[2])
+	if len(msg) < 3+idLen {
+		return "", 0, 0, nil, fmt.Errorf("refused")
+	}
+	return string(msg[3 : 3+idLen]), 0, 0, nil, nil
+}

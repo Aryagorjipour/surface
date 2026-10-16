@@ -9,15 +9,20 @@ import (
 )
 
 type Secrets struct {
-	TursoURL      string
-	TursoToken    string
-	EncryptionKey []byte
-	RedisAddr     string
-	RedisPassword string
+	TursoURL       string
+	TursoToken     string
+	EncryptionKey  []byte
+	RedisAddr      string
+	RedisPassword  string
+	ConnectorToken string
 }
 
-func Load(ctx context.Context) (*Secrets, error) {
+// Load reads secret/data/surface/connector. A non-empty addr overrides the Vault client's address.
+func Load(ctx context.Context, addr string) (*Secrets, error) {
 	cfg := vault.DefaultConfig()
+	if addr != "" {
+		cfg.Address = addr
+	}
 	client, err := vault.NewClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("vault client: %w", err)
@@ -35,9 +40,13 @@ func Load(ctx context.Context) (*Secrets, error) {
 	if !ok {
 		return nil, fmt.Errorf("vault: invalid data format")
 	}
+	return secretsFromMap(data)
+}
 
+// secretsFromMap parses one Vault data map. It does not open a connection.
+func secretsFromMap(data map[string]any) (*Secrets, error) {
 	s := &Secrets{}
-
+	var err error
 	s.TursoURL, err = requireString(data, "turso_url")
 	if err != nil {
 		return nil, err
@@ -57,14 +66,17 @@ func Load(ctx context.Context) (*Secrets, error) {
 	}
 	s.EncryptionKey = key
 
-	// optional
+	s.ConnectorToken, err = requireString(data, "connector_token")
+	if err != nil {
+		return nil, err
+	}
+
 	if v, ok := data["redis_addr"].(string); ok {
 		s.RedisAddr = v
 	}
 	if v, ok := data["redis_password"].(string); ok {
 		s.RedisPassword = v
 	}
-
 	return s, nil
 }
 

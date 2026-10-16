@@ -209,6 +209,7 @@ func TestScrubForTrace(t *testing.T) {
 	req.SetPathValue("key", "secret-key")
 	req.Header.Set("X-Forwarded-For", "203.0.113.5")
 	req.Header.Set("Forwarded", "for=203.0.113.5")
+	req.Header.Set("Authorization", "Bearer secret-token")
 	req.RemoteAddr = "198.51.100.10:9999"
 
 	got := ScrubForTrace(req, "GET /peers/{key}")
@@ -221,8 +222,11 @@ func TestScrubForTrace(t *testing.T) {
 	if got.PathValue("key") != "secret-key" {
 		t.Fatalf("path value %s", got.PathValue("key"))
 	}
-	if got.Header.Get("X-Forwarded-For") != "" || got.Header.Get("Forwarded") != "" {
+	if got.Header.Get("X-Forwarded-For") != "" || got.Header.Get("Forwarded") != "" || got.Header.Get("Authorization") != "" {
 		t.Fatal("forwarded headers kept")
+	}
+	if req.Header.Get("Authorization") != "Bearer secret-token" {
+		t.Fatal("original authorization header mutated")
 	}
 	if got.RemoteAddr != "" {
 		t.Fatalf("remote %s", got.RemoteAddr)
