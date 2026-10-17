@@ -50,6 +50,15 @@ binary. There is no stage client and no production client.
 On the caller: `lookup <key>`, then `connect <key>`. On the other side:
 `accept` and the printed id. `/quit` leaves the chat. `quit` exits.
 
+When stdin is a terminal, Surface opens a keyboard UI instead of the
+line prompt. The left pane lists peers learned from lookup and from
+incoming requests. The right pane is the scrollback. Tab moves among
+the peer list, the scrollback, and the compose line. In the peer list,
+`j` and `k` move, Enter connects, `a` accepts the selected request, and
+`r` rejects it. `l` focuses the compose line, which still takes the
+same commands. In chat, Enter sends the line and `/quit` leaves. `q`
+quits from the peer list. A pipe keeps the line commands.
+
 ## Stage and production
 
 ```sh

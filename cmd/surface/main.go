@@ -18,7 +18,9 @@ import (
 
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/Aryagorjipour/surface/internal/shared"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/coder/websocket"
+	"github.com/mattn/go-isatty"
 )
 
 type peer struct {
@@ -59,10 +61,15 @@ type app struct {
 	punchAddr   string
 	relayAddr   string
 	out         io.Writer
+	deskCh      chan tea.Msg
 }
 
 func main() {
 	logger := shared.NewLogger("surface")
+	if stdinTerminal(os.Stdin) {
+		out := discardWhenTerminal(os.Stderr, isatty.IsTerminal(os.Stderr.Fd()))
+		logger = slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "surface")
+	}
 	err := run(os.Args[1:], os.LookupEnv, logger, os.Stdin)
 	if errors.Is(err, errHelp) {
 		fmt.Print(surfaceHelp())
@@ -125,8 +132,14 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		return err
 	}
 	logger.Info("registered")
+	if stdinTerminal(stdin) {
+		a.deskCh = make(chan tea.Msg, 256)
+	}
 	go a.pollPending()
 	go a.heartbeatLoop()
+	if a.deskCh != nil {
+		return a.serveDesk(stdin, os.Stdout)
+	}
 
 	fmt.Println("commands: lookup <key> | connect <key> | accept <id> | reject <id> | quit")
 	fmt.Println("(in chat: just type messages; /quit leaves chat)")
@@ -167,11 +180,15 @@ func (a *app) handleLine(line string) error {
 		}
 		frame, err := session.Seal(sess, line, session.Highest(sess))
 		if err != nil {
-			fmt.Println("send failed:", err)
+			a.println("send failed:", err)
 			return nil
 		}
 		if err := conn.Write(a.ctx, websocket.MessageBinary, frame); err != nil {
-			fmt.Println("send failed:", err)
+			a.println("send failed:", err)
+			return nil
+		}
+		if a.deskCh != nil {
+			a.note(note{kind: noteSelf, text: line})
 		}
 		return nil
 	}
@@ -183,56 +200,42 @@ func (a *app) handleLine(line string) error {
 		return errStop
 	case "lookup":
 		if len(parts) < 2 {
-			fmt.Println("usage: lookup <key>")
+			a.println("usage: lookup <key>")
 			return nil
 		}
 		p, err := a.lookup(parts[1])
 		if err != nil {
-			fmt.Println("lookup error:", err)
+			a.println("lookup error:", err)
 			return nil
 		}
-		fmt.Printf("peer: %+v\n", p)
+		if a.deskCh != nil {
+			a.note(note{kind: noteLookup, key: p.Key, state: p.State, address: p.Address, text: fmt.Sprintf("peer: %+v", p)})
+		} else {
+			fmt.Printf("peer: %+v\n", p)
+		}
 	case "connect":
 		if len(parts) < 2 {
-			fmt.Println("usage: connect <key>")
+			a.println("usage: connect <key>")
 			return nil
 		}
 		if err := a.doConnect(parts[1]); err != nil {
-			fmt.Println("connect error:", err)
+			a.println("connect error:", err)
+			a.markPhase(phaseLobby)
 		}
 	case "accept":
 		if len(parts) < 2 {
-			fmt.Println("usage: accept <request-id>")
+			a.println("usage: accept <request-id>")
 			return nil
 		}
-		proofText, err := a.postAction(parts[1], "accept")
-		if err != nil {
-			fmt.Println("accept error:", err)
-			return nil
-		}
-		raw, err := session.DecodeProof(proofText)
-		if err != nil {
-			fmt.Println("accept error:", err)
-			return nil
-		}
-		from := a.callerFor(parts[1])
-		a.gate.remember(parts[1], from, a.myKey, raw)
-		a.say("accepted — waiting for peer to dial")
-		go func() {
-			_ = a.attempt(false, "", parts[1], from, a.myKey, raw)
-		}()
+		_ = a.acceptRequest(parts[1])
 	case "reject":
 		if len(parts) < 2 {
-			fmt.Println("usage: reject <request-id>")
+			a.println("usage: reject <request-id>")
 			return nil
 		}
-		if _, err := a.postAction(parts[1], "reject"); err != nil {
-			fmt.Println("reject error:", err)
-		} else {
-			a.say("rejected")
-		}
+		_ = a.rejectRequest(parts[1])
 	default:
-		fmt.Println("unknown command")
+		a.println("unknown command")
 	}
 	return nil
 }
@@ -255,7 +258,8 @@ func (a *app) quitChat() {
 		}
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}
-	fmt.Println("left chat")
+	a.println("left chat")
+	a.markPhase(phaseLobby)
 }
 
 func (a *app) drain(body io.ReadCloser) {
@@ -394,7 +398,11 @@ func (a *app) pollPending() {
 				a.mu.Lock()
 				a.fromKey[id] = from
 				a.mu.Unlock()
-				fmt.Printf("\n>>> incoming request from %s\n>>> id: %s\n>>> type: accept %s   or   reject %s\n> ", from, id, id, id)
+				if a.deskCh != nil {
+					a.note(note{kind: noteInvite, key: from, id: id})
+				} else {
+					fmt.Printf("\n>>> incoming request from %s\n>>> id: %s\n>>> type: accept %s   or   reject %s\n> ", from, id, id, id)
+				}
 			}
 		}
 	}
@@ -449,7 +457,7 @@ func (a *app) doConnect(target string) error {
 	if err := json.NewDecoder(resp.Body).Decode(&cr); err != nil {
 		return err
 	}
-	fmt.Println("request created:", cr.RequestID)
+	a.println("request created:", cr.RequestID)
 
 	for i := 0; i < 30; i++ {
 		time.Sleep(acceptPoll)
@@ -540,6 +548,10 @@ func (a *app) onIncoming(c byteConn) {
 }
 
 func (a *app) say(args ...any) {
+	if a != nil && a.deskCh != nil {
+		a.note(note{kind: noteText, text: lineText(args...)})
+		return
+	}
 	if a == nil || a.out == nil {
 		fmt.Println(args...)
 		return
@@ -586,6 +598,7 @@ func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr str
 	a.resumeUntil = time.Time{}
 	a.mu.Unlock()
 	go a.chatLoop(c)
+	a.markPhase(phaseChat)
 	return true
 }
 
@@ -596,6 +609,7 @@ func (a *app) resumeAttached(c byteConn, sess *session.Session) {
 	a.sess = sess
 	a.resumeUntil = time.Time{}
 	a.mu.Unlock()
+	a.markPhase(phaseChat)
 	go a.chatLoop(c)
 }
 
@@ -649,7 +663,11 @@ func (a *app) readLoop(c byteConn) bool {
 			return false
 		}
 		if display {
-			fmt.Printf("peer: %s\n> ", text)
+			if a.deskCh != nil {
+				a.note(note{kind: notePeer, text: text})
+			} else {
+				fmt.Printf("peer: %s\n> ", text)
+			}
 		}
 	}
 }
@@ -688,7 +706,7 @@ func (a *app) endSession(quit bool) {
 	a.resumeUntil = time.Time{}
 	a.mu.Unlock()
 	if !quit {
-		fmt.Println("\nchat ended")
+		a.showEnded()
 	}
 }
 
@@ -702,7 +720,7 @@ func (a *app) armBreak(c byteConn) bool {
 		a.inChat = false
 		a.chatConn = nil
 		a.mu.Unlock()
-		fmt.Println("\nchat ended")
+		a.showEnded()
 		a.mu.Lock()
 		return false
 	}
@@ -729,7 +747,7 @@ func (a *app) watchResume(until time.Time) {
 		a.inChat = false
 		a.resumeUntil = time.Time{}
 		a.mu.Unlock()
-		fmt.Println("\nchat ended")
+		a.showEnded()
 	}
 }
 
@@ -792,5 +810,5 @@ func (a *app) expireResume() {
 	a.inChat = false
 	a.resumeUntil = time.Time{}
 	a.mu.Unlock()
-	fmt.Println("\nchat ended")
+	a.showEnded()
 }
