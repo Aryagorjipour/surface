@@ -18,4 +18,4 @@ From the repository root, with [just](https://github.com/casey/just) 1.58.0 or n
 just help
 ```
 
-`just` prints the same guide. It is the only way to start the dev Connector, a dev Surface, or the stage and production Connector. The dev stack allows 240 requests per source per minute so two Surfaces on one machine can connect. The deployment steps are in [deployments/README.md](deployments/README.md).
+`just` prints the same guide. It is the only way to start the dev Connector, a dev Surface, or the stage and production Connector. The dev stack allows 240 requests per source per minute so two Surfaces on one machine can connect. An interactive terminal opens a keyboard UI. A pipe keeps the line commands. The deployment steps are in [deployments/README.md](deployments/README.md).
