@@ -37,12 +37,12 @@ func TestInviteAcceptAndReject(t *testing.T) {
 		t.Fatalf("transcript %v", s.lines)
 	}
 	_, in := reduce(s, key("a"))
-	if in.accept != "req-1" {
-		t.Fatalf("accept %q", in.accept)
+	if in.line != "accept req-1" {
+		t.Fatalf("accept %q", in.line)
 	}
 	_, in = reduce(s, key("r"))
-	if in.reject != "req-1" {
-		t.Fatalf("reject %q", in.reject)
+	if in.line != "reject req-1" {
+		t.Fatalf("reject %q", in.line)
 	}
 }
 
@@ -55,6 +55,21 @@ func TestEnterConnectsSelectedPeer(t *testing.T) {
 	}
 	if next.phase != phaseConnecting {
 		t.Fatalf("phase %d", next.phase)
+	}
+}
+
+func TestEnterFocusesLiveChat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{ctx: ctx, cancel: cancel, maxChats: 4}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-bob", "bob")
+	s := newScreen(a)
+	s.phase = phaseChat
+	s = applyNote(s, note{kind: noteLookup, key: "bob", state: "available", address: "127.0.0.1:9", text: "peer: bob"})
+	_, in := reduce(s, key("enter"))
+	if in.line != "/focus req-bob" {
+		t.Fatalf("line %q", in.line)
 	}
 }
 

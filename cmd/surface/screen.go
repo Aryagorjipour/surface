@@ -53,10 +53,8 @@ type row struct {
 }
 
 type intent struct {
-	line   string
-	accept string
-	reject string
-	quit   bool
+	line string
+	quit bool
 }
 
 type lineDone struct{ err error }
@@ -91,7 +89,7 @@ func newScreen(a *app) screen {
 		myKey:  key,
 		lines: []string{
 			"commands: lookup <key> | connect <key> | accept <id> | reject <id> | quit",
-			"(in chat: just type messages; /quit leaves chat)",
+			"(in chat: type messages; /chats /focus /quit; lobby verbs still work)",
 		},
 	}
 }
@@ -106,21 +104,12 @@ func (s screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return next, tea.Quit
 	}
-	if next.app == nil || (in.line == "" && in.accept == "" && in.reject == "") {
+	if next.app == nil || in.line == "" {
 		return next, nil
 	}
 	app := next.app
-	line, accept, reject := in.line, in.accept, in.reject
+	line := in.line
 	return next, func() tea.Msg {
-		if accept != "" {
-			_ = app.acceptRequest(accept)
-		}
-		if reject != "" {
-			_ = app.rejectRequest(reject)
-		}
-		if line == "" {
-			return nil
-		}
 		return lineDone{err: app.handleLine(line)}
 	}
 }
@@ -252,23 +241,24 @@ func reducePeers(s screen, k tea.KeyMsg) (screen, intent) {
 		}
 	case "enter":
 		row, ok := s.selected()
-		if ok && row.key != "" && s.phase != phaseChat {
-			s.phase = phaseConnecting
-			s.hint = "connecting"
-			return s, intent{line: "connect " + row.key}
+		if !ok || row.key == "" {
+			break
 		}
-		if s.phase == phaseChat {
-			s.hint = "type /quit to leave chat"
+		if id := s.liveIDFor(row.key); id != "" {
+			return s, intent{line: "/focus " + string(id)}
 		}
+		s.phase = phaseConnecting
+		s.hint = "connecting"
+		return s, intent{line: "connect " + row.key}
 	case "a":
 		row, ok := s.selected()
 		if ok && row.invite != "" {
-			return s, intent{accept: row.invite}
+			return s, intent{line: "accept " + row.invite}
 		}
 	case "r":
 		row, ok := s.selected()
 		if ok && row.invite != "" {
-			return s, intent{reject: row.invite}
+			return s, intent{line: "reject " + row.invite}
 		}
 	case "q":
 		if s.phase == phaseChat {
@@ -476,6 +466,9 @@ func (s screen) peerLines(width, n int) []string {
 		if row.invite != "" {
 			state = "request"
 		}
+		if id := s.liveIDFor(row.key); id != "" {
+			state = "live"
+		}
 		out[i] = mark + row.key + " " + state
 	}
 	return out
@@ -488,28 +481,62 @@ func (s screen) chatLines(width, n int) []string {
 		title = s.myKey
 	}
 	out[0] = fit(title, width)
+	lines := s.lines
+	if c, ok := s.focusedConv(); ok {
+		lines = c.Lines()
+	}
 	start := s.top
+	if _, ok := s.focusedConv(); ok && s.follow {
+		body := n - 1
+		start = len(lines) - body
+		if start < 0 {
+			start = 0
+		}
+	}
 	for i := 1; i < n; i++ {
 		idx := start + i - 1
-		if idx >= 0 && idx < len(s.lines) {
-			out[i] = s.lines[idx]
+		if idx >= 0 && idx < len(lines) {
+			out[i] = lines[idx]
 		}
 	}
 	return out
+}
+
+func (s screen) focusedConv() (*Conversation, bool) {
+	if s.app == nil || s.app.registry == nil {
+		return nil, false
+	}
+	return s.app.registry.Focused()
+}
+
+func (s screen) liveIDFor(peer string) ConvID {
+	if s.app == nil || s.app.registry == nil {
+		return ""
+	}
+	return s.app.registry.IDForPeer(peer)
 }
 
 func (s screen) statusText() string {
 	if s.hint != "" {
 		return s.hint
 	}
+	extra := ""
+	if s.app != nil && s.app.registry != nil {
+		extra = strings.Join(s.app.registry.StatusLines(), " | ")
+	}
+	var base string
 	switch s.phase {
 	case phaseChat:
-		return "chat  tab switches pane  enter sends  /quit leaves"
+		base = "chat  tab switches pane  enter sends  /quit leaves  /focus /chats"
 	case phaseConnecting:
-		return "connecting"
+		base = "connecting"
 	default:
-		return "lobby  j/k move  enter connect  a accept  r reject  l type  q quit"
+		base = "lobby  j/k move  enter connect  a accept  r reject  l type  q quit"
 	}
+	if extra == "" {
+		return base
+	}
+	return base + "  " + extra
 }
 
 func (s screen) composeText() string {
