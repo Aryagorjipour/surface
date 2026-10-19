@@ -360,7 +360,6 @@ func reduceMouse(s screen, m tea.MouseMsg) (screen, intent, tea.Cmd) {
 		s.focus = focusCompose
 		s.hint = ""
 	case m.Y == body:
-		// status strip keeps current focus
 	case m.X <= leftW:
 		s.focus = focusPeers
 		s.hint = ""
