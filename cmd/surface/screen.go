@@ -782,7 +782,7 @@ var (
 	colorWarn   = lipgloss.AdaptiveColor{Light: "#8A5A00", Dark: "#E3B341"}
 	colorErr    = lipgloss.AdaptiveColor{Light: "#9B1D20", Dark: "#F85149"}
 
-	styleSep = lipgloss.NewStyle().Foreground(colorMuted)
+	styleSep    = lipgloss.NewStyle().Foreground(colorMuted)
 	styleStatus = lipgloss.NewStyle().
 			Foreground(colorMuted).
 			Background(colorPanel)
