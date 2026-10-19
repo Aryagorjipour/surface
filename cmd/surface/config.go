@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,6 +22,7 @@ type surfaceConfig struct {
 	pending   time.Duration
 	relay     string
 	punch     string
+	maxChats  int
 	rest      []string
 }
 
@@ -36,6 +38,8 @@ func surfaceHelp() string {
         relay address (default unset)
   --punch address
         punch address (default the connector host port 8081)
+  --max-chats int
+        max concurrent chats (default 4)
   --config path
         config file (default unset)
   --help
@@ -49,6 +53,7 @@ var surfaceFileKeys = map[string]struct{}{
 	"SURFACE_PENDING_POLL":       {},
 	"SURFACE_RELAY":              {},
 	"SURFACE_PUNCH":              {},
+	"SURFACE_MAX_CHATS":          {},
 	"SURFACE_CONFIG":             {},
 }
 
@@ -79,6 +84,7 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	pending := fs.String("pending-poll", "2s", "pending poll interval")
 	relayFlag := fs.String("relay", "", "relay address")
 	punchFlag := fs.String("punch", "", "punch address")
+	maxChatsFlag := fs.String("max-chats", "4", "max concurrent chats")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
 		return surfaceConfig{}, err
@@ -124,6 +130,10 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 			if set["pending-poll"] && *pending != "" {
 				return *pending, true
 			}
+		case "SURFACE_MAX_CHATS":
+			if set["max-chats"] && *maxChatsFlag != "" {
+				return *maxChatsFlag, true
+			}
 		}
 		if raw, ok := lookup(name); ok && raw != "" {
 			return raw, true
@@ -150,7 +160,11 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	if !punchSet && len(fs.Args()) > 0 {
 		punch = defaultPunch(fs.Args()[0])
 	}
-	return surfaceConfig{heartbeat: hb, resume: window, pending: poll, relay: relay, punch: punch, rest: fs.Args()}, nil
+	maxChats, err := positiveInt(merged, "SURFACE_MAX_CHATS", 4)
+	if err != nil {
+		return surfaceConfig{}, err
+	}
+	return surfaceConfig{heartbeat: hb, resume: window, pending: poll, relay: relay, punch: punch, maxChats: maxChats, rest: fs.Args()}, nil
 }
 
 func pickSurface(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string, name string) (string, bool) {
@@ -176,6 +190,18 @@ func defaultPunch(rawURL string) string {
 		return ""
 	}
 	return net.JoinHostPort(host, "8081")
+}
+
+func positiveInt(lookup func(string) (string, bool), name string, fallback int) (int, error) {
+	raw, ok := lookup(name)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%s not a positive integer", name)
+	}
+	return n, nil
 }
 
 func positiveDuration(lookup func(string) (string, bool), name string, fallback time.Duration) (time.Duration, error) {
