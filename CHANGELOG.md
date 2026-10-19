@@ -4,6 +4,9 @@
 
 ### Added
 
+- Surface desk shows system and connection events as timed toasts instead of transcript lines.
+- Surface desk supports mouse wheel scroll and click to focus panes, select peers, and dismiss toasts.
+- Surface desk uses Lip Gloss styling for pane titles, chat roles, status, compose, and toast overlays.
 - `just help` starts the dev Connector, a dev Surface from source, and the stage or production Connector.
 
 ### Fixed

@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type phase uint8
@@ -33,6 +35,16 @@ const (
 	noteInvite
 	notePhase
 	noteClear
+	noteToast
+)
+
+type toastLevel uint8
+
+const (
+	toastInfo toastLevel = iota
+	toastSuccess
+	toastWarn
+	toastError
 )
 
 type note struct {
@@ -43,6 +55,7 @@ type note struct {
 	id      string
 	state   string
 	address string
+	level   toastLevel
 }
 
 type row struct {
@@ -61,21 +74,38 @@ type intent struct {
 
 type lineDone struct{ err error }
 
+type toast struct {
+	id    uint64
+	level toastLevel
+	text  string
+}
+
+type toastExpired struct{ id uint64 }
+
+const (
+	toastTTL    = 3 * time.Second
+	maxToasts   = 3
+	toastMaxW   = 36
+	chromeLines = 2
+)
+
 type screen struct {
-	app     *app
-	phase   phase
-	focus   focus
-	rows    []row
-	sel     int
-	lines   []string
-	follow  bool
-	top     int
-	compose string
-	cursor  int
-	width   int
-	height  int
-	myKey   string
-	hint    string
+	app      *app
+	phase    phase
+	focus    focus
+	rows     []row
+	sel      int
+	lines    []string
+	follow   bool
+	top      int
+	compose  string
+	cursor   int
+	width    int
+	height   int
+	myKey    string
+	hint     string
+	toasts   []toast
+	toastSeq uint64
 }
 
 func newScreen(a *app) screen {
@@ -99,87 +129,76 @@ func newScreen(a *app) screen {
 func (s screen) Init() tea.Cmd { return nil }
 
 func (s screen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	next, in := reduce(s, msg)
+	next, in, cmd := reduce(s, msg)
 	if in.quit {
 		if next.app != nil {
 			next.app.cancel()
 		}
 		return next, tea.Quit
 	}
-	if next.app == nil || (in.line == "" && in.accept == "" && in.reject == "") {
-		return next, nil
+	var action tea.Cmd
+	if next.app != nil && (in.line != "" || in.accept != "" || in.reject != "") {
+		app := next.app
+		line, accept, reject := in.line, in.accept, in.reject
+		action = func() tea.Msg {
+			if accept != "" {
+				_ = app.acceptRequest(accept)
+			}
+			if reject != "" {
+				_ = app.rejectRequest(reject)
+			}
+			if line == "" {
+				return nil
+			}
+			return lineDone{err: app.handleLine(line)}
+		}
 	}
-	app := next.app
-	line, accept, reject := in.line, in.accept, in.reject
-	return next, func() tea.Msg {
-		if accept != "" {
-			_ = app.acceptRequest(accept)
-		}
-		if reject != "" {
-			_ = app.rejectRequest(reject)
-		}
-		if line == "" {
-			return nil
-		}
-		return lineDone{err: app.handleLine(line)}
-	}
+	return next, tea.Batch(cmd, action)
 }
 
 func (s screen) View() string {
-	width := s.width
-	height := s.height
-	if width < 20 {
-		width = 20
-	}
-	if height < 6 {
-		height = 6
-	}
-	leftW := 20
-	if width < 70 {
-		leftW = 16
-	}
-	rightW := width - leftW - 1
-	body := height - 2
+	width, height, leftW, rightW, body := s.geom()
 	left := s.peerLines(leftW, body)
 	right := s.chatLines(rightW, body)
-	var b strings.Builder
+	rows := make([]string, 0, height)
 	for i := 0; i < body; i++ {
-		b.WriteString(fit(left[i], leftW))
-		b.WriteByte('|')
-		b.WriteString(fit(right[i], rightW))
-		if i+1 < body {
-			b.WriteByte('\n')
-		}
+		l := stylePaneCell(left[i], leftW, i == 0, s.focus == focusPeers)
+		r := stylePaneCell(right[i], rightW, i == 0, s.focus == focusScroll)
+		sep := styleSep.Render("│")
+		rows = append(rows, l+sep+r)
 	}
-	b.WriteByte('\n')
-	b.WriteString(fit(s.statusText(), width))
-	b.WriteByte('\n')
-	b.WriteString(fit(s.composeText(), width))
-	return b.String()
+	rows = append(rows, styleStatus.Width(width).Render(fit(s.statusText(), width)))
+	rows = append(rows, styleCompose(s.focus == focusCompose).Width(width).Render(fit(s.composeText(), width)))
+	rows = s.overlayToasts(rows, width)
+	return strings.Join(rows, "\n")
 }
 
-func reduce(s screen, msg tea.Msg) (screen, intent) {
+func reduce(s screen, msg tea.Msg) (screen, intent, tea.Cmd) {
 	switch m := msg.(type) {
 	case tea.WindowSizeMsg:
 		s.width = m.Width
 		s.height = m.Height
 		s = s.stick()
-		return s, intent{}
+		return s, intent{}, nil
 	case note:
-		return applyNote(s, m), intent{}
+		return applyNote(s, m)
+	case toastExpired:
+		return s.dropToast(m.id), intent{}, nil
 	case lineDone:
 		if errors.Is(m.err, errStop) {
-			return s, intent{quit: true}
+			return s, intent{quit: true}, nil
 		}
-		return s, intent{}
+		return s, intent{}, nil
+	case tea.MouseMsg:
+		return reduceMouse(s, m)
 	case tea.KeyMsg:
 		return reduceKey(s, m)
 	default:
-		return s, intent{}
+		return s, intent{}, nil
 	}
 }
 
-func applyNote(s screen, n note) screen {
+func applyNote(s screen, n note) (screen, intent, tea.Cmd) {
 	switch n.kind {
 	case noteText:
 		text := strings.Trim(n.text, "\n")
@@ -197,7 +216,10 @@ func applyNote(s screen, n note) screen {
 		}
 	case noteInvite:
 		s = s.touch(n.key, "", "", n.id)
-		s = s.addLine("incoming request from " + n.key + " id " + n.id)
+		text := "incoming request from " + n.key + " id " + n.id
+		var cmd tea.Cmd
+		s, cmd = s.pushToast(toastInfo, text)
+		return s, intent{}, cmd
 	case notePhase:
 		s.phase = n.phase
 		s.hint = ""
@@ -213,31 +235,164 @@ func applyNote(s screen, n note) screen {
 				s.rows[i].invite = ""
 			}
 		}
+	case noteToast:
+		text := strings.Trim(n.text, "\n")
+		if text == "" {
+			return s, intent{}, nil
+		}
+		var cmd tea.Cmd
+		s, cmd = s.pushToast(n.level, text)
+		return s, intent{}, cmd
 	}
+	return s, intent{}, nil
+}
+
+func (s screen) pushToast(level toastLevel, text string) (screen, tea.Cmd) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return s, nil
+	}
+	for i := range s.toasts {
+		if s.toasts[i].text == text {
+			id := s.toasts[i].id
+			s.toasts[i].level = level
+			return s, toastTick(id)
+		}
+	}
+	s.toastSeq++
+	id := s.toastSeq
+	s.toasts = append(s.toasts, toast{id: id, level: level, text: text})
+	if len(s.toasts) > maxToasts {
+		s.toasts = s.toasts[len(s.toasts)-maxToasts:]
+	}
+	return s, toastTick(id)
+}
+
+func toastTick(id uint64) tea.Cmd {
+	return tea.Tick(toastTTL, func(time.Time) tea.Msg {
+		return toastExpired{id: id}
+	})
+}
+
+func (s screen) dropToast(id uint64) screen {
+	out := s.toasts[:0]
+	for _, t := range s.toasts {
+		if t.id != id {
+			out = append(out, t)
+		}
+	}
+	s.toasts = out
 	return s
 }
 
-func reduceKey(s screen, k tea.KeyMsg) (screen, intent) {
+func (s screen) dismissTopToast() screen {
+	if len(s.toasts) == 0 {
+		return s
+	}
+	return s.dropToast(s.toasts[0].id)
+}
+
+func reduceKey(s screen, k tea.KeyMsg) (screen, intent, tea.Cmd) {
 	switch k.String() {
 	case "ctrl+c":
-		return s, intent{quit: true}
+		return s, intent{quit: true}, nil
+	case "esc":
+		if len(s.toasts) > 0 {
+			return s.dismissTopToast(), intent{}, nil
+		}
 	case "tab":
 		s.focus = (s.focus + 1) % 3
 		s.hint = ""
-		return s, intent{}
+		return s, intent{}, nil
 	case "shift+tab":
 		s.focus = (s.focus + 2) % 3
 		s.hint = ""
-		return s, intent{}
+		return s, intent{}, nil
 	}
 	switch s.focus {
 	case focusScroll:
-		return reduceScroll(s, k)
+		next, in := reduceScroll(s, k)
+		return next, in, nil
 	case focusCompose:
-		return reduceCompose(s, k)
+		next, in := reduceCompose(s, k)
+		return next, in, nil
 	default:
-		return reducePeers(s, k)
+		next, in := reducePeers(s, k)
+		return next, in, nil
 	}
+}
+
+func reduceMouse(s screen, m tea.MouseMsg) (screen, intent, tea.Cmd) {
+	width, _, leftW, _, body := s.geom()
+	if m.Button == tea.MouseButtonWheelUp || m.Button == tea.MouseButtonWheelDown {
+		overChat := m.X > leftW
+		overPeers := m.X <= leftW
+		if overChat || s.focus == focusScroll {
+			s.focus = focusScroll
+			s.follow = false
+			if m.Button == tea.MouseButtonWheelUp && s.top > 0 {
+				s.top--
+			}
+			if m.Button == tea.MouseButtonWheelDown && s.top+1 < len(s.lines) {
+				s.top++
+			}
+			return s, intent{}, nil
+		}
+		if overPeers {
+			s.focus = focusPeers
+			if m.Button == tea.MouseButtonWheelUp && s.sel > 0 {
+				s.sel--
+			}
+			if m.Button == tea.MouseButtonWheelDown && s.sel+1 < len(s.rows) {
+				s.sel++
+			}
+		}
+		return s, intent{}, nil
+	}
+	if m.Action != tea.MouseActionPress || m.Button != tea.MouseButtonLeft {
+		return s, intent{}, nil
+	}
+	if hit, ok := s.toastHit(m.X, m.Y, width); ok {
+		return s.dropToast(hit), intent{}, nil
+	}
+	switch {
+	case m.Y >= body+1:
+		s.focus = focusCompose
+		s.hint = ""
+	case m.Y == body:
+		// status strip keeps current focus
+	case m.X <= leftW:
+		s.focus = focusPeers
+		s.hint = ""
+		row := m.Y - 1
+		if row >= 0 && row < len(s.rows) {
+			s.sel = row
+		}
+	default:
+		s.focus = focusScroll
+		s.hint = ""
+	}
+	return s, intent{}, nil
+}
+
+func (s screen) toastHit(x, y, width int) (uint64, bool) {
+	if y < 0 || y >= len(s.toasts) {
+		return 0, false
+	}
+	t := s.toasts[y]
+	label := toastStyle(t.level).MaxWidth(toastMaxW).Render(toastLabel(t))
+	tw := lipgloss.Width(label)
+	if tw > width {
+		tw = width
+	}
+	start := width - tw
+	if start < 0 {
+		start = 0
+	}
+	if x < start {
+		return 0, false
+	}
+	return t.id, true
 }
 
 func reducePeers(s screen, k tea.KeyMsg) (screen, intent) {
@@ -425,12 +580,37 @@ func (s screen) clampTop() screen {
 	return s
 }
 
-func (s screen) bodyHeight() int {
-	h := s.height - 2
-	if h < 1 {
-		return 1
+func (s screen) geom() (width, height, leftW, rightW, body int) {
+	width = s.width
+	height = s.height
+	if width < 20 {
+		width = 20
 	}
-	return h
+	if height < 6 {
+		height = 6
+	}
+	leftW = 22
+	if width < 70 {
+		leftW = 16
+	}
+	rightW = width - leftW - 1
+	if rightW < 8 {
+		rightW = 8
+		leftW = width - rightW - 1
+		if leftW < 8 {
+			leftW = 8
+		}
+	}
+	body = height - chromeLines
+	if body < 1 {
+		body = 1
+	}
+	return width, height, leftW, rightW, body
+}
+
+func (s screen) bodyHeight() int {
+	_, _, _, _, body := s.geom()
+	return body
 }
 
 func (s screen) insert(text string) screen {
@@ -470,7 +650,7 @@ func (s screen) peerLines(width, n int) []string {
 		row := s.rows[idx]
 		mark := "  "
 		if idx == s.sel && s.focus == focusPeers {
-			mark = "> "
+			mark = "▸ "
 		}
 		state := row.state
 		if row.invite != "" {
@@ -504,24 +684,80 @@ func (s screen) statusText() string {
 	}
 	switch s.phase {
 	case phaseChat:
-		return "chat  tab switches pane  enter sends  /quit leaves"
+		return "chat  tab panes  enter send  wheel scroll  click focus  /quit leave"
 	case phaseConnecting:
 		return "connecting"
 	default:
-		return "lobby  j/k move  enter connect  a accept  r reject  l type  q quit"
+		return "lobby  j/k move  enter connect  a/r invite  wheel/click  l type  q quit"
 	}
 }
 
 func (s screen) composeText() string {
-	prompt := "> "
-	if s.focus == focusCompose {
-		prompt = "> "
-	}
+	prompt := "› "
 	runes := []rune(s.compose)
 	if s.cursor > len(runes) {
 		s.cursor = len(runes)
 	}
-	return prompt + string(runes[:s.cursor]) + string(runes[s.cursor:])
+	if s.focus == focusCompose {
+		return prompt + string(runes[:s.cursor]) + "█" + string(runes[s.cursor:])
+	}
+	return prompt + string(runes)
+}
+
+func (s screen) overlayToasts(rows []string, width int) []string {
+	if len(s.toasts) == 0 || width < 8 {
+		return rows
+	}
+	limit := len(s.toasts)
+	if limit > len(rows) {
+		limit = len(rows)
+	}
+	for i := 0; i < limit; i++ {
+		label := toastStyle(s.toasts[i].level).MaxWidth(toastMaxW).Render(toastLabel(s.toasts[i]))
+		rows[i] = overlayRight(rows[i], label, width)
+	}
+	return rows
+}
+
+func toastLabel(t toast) string {
+	prefix := "info"
+	switch t.level {
+	case toastSuccess:
+		prefix = "ok"
+	case toastWarn:
+		prefix = "warn"
+	case toastError:
+		prefix = "err"
+	}
+	return " " + prefix + " · " + t.text + " "
+}
+
+func overlayRight(base, overlay string, width int) string {
+	ow := lipgloss.Width(overlay)
+	if ow >= width {
+		return lipgloss.NewStyle().MaxWidth(width).Render(overlay)
+	}
+	keep := width - ow
+	if keep < 0 {
+		keep = 0
+	}
+	trimmed := truncateCells(base, keep)
+	pad := keep - lipgloss.Width(trimmed)
+	if pad < 0 {
+		pad = 0
+	}
+	return trimmed + strings.Repeat(" ", pad) + overlay
+}
+
+func truncateCells(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+	runes := []rune(lipgloss.NewStyle().MaxWidth(width).Render(text))
+	return string(runes)
 }
 
 func fit(text string, width int) string {
@@ -533,4 +769,77 @@ func fit(text string, width int) string {
 		return string(runes[:width])
 	}
 	return text + strings.Repeat(" ", width-len(runes))
+}
+
+var (
+	colorMuted  = lipgloss.AdaptiveColor{Light: "#5A6570", Dark: "#8B949E"}
+	colorAccent = lipgloss.AdaptiveColor{Light: "#0F6B4C", Dark: "#3DDC97"}
+	colorFocus  = lipgloss.AdaptiveColor{Light: "#1A1F24", Dark: "#E6EDF3"}
+	colorPanel  = lipgloss.AdaptiveColor{Light: "#F3F5F7", Dark: "#161B22"}
+	colorInfo   = lipgloss.AdaptiveColor{Light: "#0B4F6C", Dark: "#7EC8E3"}
+	colorOk     = lipgloss.AdaptiveColor{Light: "#0F6B4C", Dark: "#3DDC97"}
+	colorWarn   = lipgloss.AdaptiveColor{Light: "#8A5A00", Dark: "#E3B341"}
+	colorErr    = lipgloss.AdaptiveColor{Light: "#9B1D20", Dark: "#F85149"}
+
+	styleSep = lipgloss.NewStyle().Foreground(colorMuted)
+	styleStatus = lipgloss.NewStyle().
+			Foreground(colorMuted).
+			Background(colorPanel)
+	styleTitle = lipgloss.NewStyle().
+			Foreground(colorAccent).
+			Bold(true)
+	styleTitleFocus = lipgloss.NewStyle().
+			Foreground(colorFocus).
+			Background(colorAccent).
+			Bold(true)
+	styleComposeIdle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+	styleComposeFocus = lipgloss.NewStyle().
+				Foreground(colorFocus).
+				Bold(true)
+)
+
+func stylePaneCell(text string, width int, title, focused bool) string {
+	fitted := fit(text, width)
+	if title {
+		st := styleTitle
+		if focused {
+			st = styleTitleFocus
+		}
+		return st.Width(width).Render(fitted)
+	}
+	trimmed := strings.TrimSpace(text)
+	switch {
+	case strings.HasPrefix(text, "▸ "):
+		return lipgloss.NewStyle().Foreground(colorAccent).Width(width).Render(fitted)
+	case strings.HasPrefix(trimmed, "you:"):
+		return lipgloss.NewStyle().Foreground(colorAccent).Width(width).Render(fitted)
+	case strings.HasPrefix(trimmed, "peer:"):
+		return lipgloss.NewStyle().Foreground(colorInfo).Width(width).Render(fitted)
+	default:
+		return lipgloss.NewStyle().Width(width).Render(fitted)
+	}
+}
+
+func styleCompose(focused bool) lipgloss.Style {
+	if focused {
+		return styleComposeFocus
+	}
+	return styleComposeIdle
+}
+
+func toastStyle(level toastLevel) lipgloss.Style {
+	fg := colorInfo
+	switch level {
+	case toastSuccess:
+		fg = colorOk
+	case toastWarn:
+		fg = colorWarn
+	case toastError:
+		fg = colorErr
+	}
+	return lipgloss.NewStyle().
+		Foreground(lipgloss.AdaptiveColor{Light: "#F7FAFC", Dark: "#0D1117"}).
+		Background(fg).
+		Bold(true)
 }

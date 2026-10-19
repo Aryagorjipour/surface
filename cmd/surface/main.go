@@ -549,7 +549,7 @@ func (a *app) onIncoming(c byteConn) {
 
 func (a *app) say(args ...any) {
 	if a != nil && a.deskCh != nil {
-		a.note(note{kind: noteText, text: lineText(args...)})
+		a.note(note{kind: noteToast, level: toastInfo, text: lineText(args...)})
 		return
 	}
 	if a == nil || a.out == nil {
