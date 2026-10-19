@@ -104,10 +104,15 @@ func (c *Conversation) Lines() []string {
 }
 
 func (c *Conversation) inResume() bool {
+	resume, _ := c.statusBits()
+	return resume
+}
+
+func (c *Conversation) statusBits() (resume bool, unread int) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	_, ok := c.carrier.(carrierResumeGap)
-	return ok
+	_, resume = c.carrier.(carrierResumeGap)
+	return resume, c.unread
 }
 
 func (c *Conversation) resumeDeadline() time.Time {

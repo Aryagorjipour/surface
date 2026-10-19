@@ -20,12 +20,13 @@ func connectedPrompt(dialer bool) string {
 	return ">>> peer connected — type messages (/quit to leave)"
 }
 
-// Gate admits one direct chat and spends each request id once.
+// Gate spends each request id once. It does not cap how many ids may be live.
 type Gate struct {
 	mu       sync.Mutex
 	live     map[string]*session.Session
 	invites  map[string]invite
 	readable func(requestID string) bool
+	until    func(requestID string) time.Time
 }
 
 type invite struct {
@@ -47,6 +48,17 @@ func (g *Gate) session(requestID string) *session.Session {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.live[requestID]
+}
+
+func (g *Gate) idOf(sess *session.Session) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, s := range g.live {
+		if s == sess {
+			return id
+		}
+	}
+	return ""
 }
 
 func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
@@ -139,7 +151,13 @@ func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time,
 			return nil, err
 		}
 		sess := g.session(id)
-		reply, err := session.AcceptResume(sess, msg, now, deadline)
+		d := deadline
+		if g.until != nil {
+			if u := g.until(id); !u.IsZero() {
+				d = u
+			}
+		}
+		reply, err := session.AcceptResume(sess, msg, now, d)
 		if err != nil {
 			recordRefused(ctx)
 			_ = conn.Close(websocket.StatusPolicyViolation, "")

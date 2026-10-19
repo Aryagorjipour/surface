@@ -53,11 +53,6 @@ func (a *app) println(args ...any) {
 	fmt.Println(args...)
 }
 
-func (a *app) showEnded() {
-	a.println("\nchat ended")
-	a.markPhase(phaseLobby)
-}
-
 func (a *app) serveDesk(in io.Reader, out io.Writer) error {
 	s := newScreen(a)
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
@@ -81,6 +76,11 @@ func (a *app) acceptRequest(id string) error {
 	if id == "" {
 		a.println("usage: accept <request-id>")
 		return errors.New("usage")
+	}
+	a.initRegistry()
+	if a.registry.AtCapacity() {
+		a.println("at capacity")
+		return ErrAtCapacity
 	}
 	proofText, err := a.postAction(id, "accept")
 	if err != nil {

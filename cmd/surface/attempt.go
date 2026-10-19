@@ -44,7 +44,7 @@ func (a *app) attempt(dialer bool, addr, id, caller, target string, proof []byte
 		if a.dialDirect(ctx, addr, id, caller, target, proof) {
 			return nil
 		}
-	} else if a.waitConnected(ctx, dialTimeout) {
+	} else if a.waitConnected(ctx, dialTimeout, id) {
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -54,7 +54,7 @@ func (a *app) attempt(dialer bool, addr, id, caller, target string, proof []byte
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if a.chatting() {
+		if a.chatting(id) {
 			cancel()
 			return nil
 		}
@@ -70,7 +70,7 @@ func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof []
 	if strings.TrimSpace(a.punchAddr) != "" {
 		a.punchPath(ctx, id, caller, target, proof, dialer)
 	}
-	if a.chatting() || ctx.Err() != nil {
+	if a.chatting(id) || ctx.Err() != nil {
 		return
 	}
 	if strings.TrimSpace(a.relayAddr) != "" {
@@ -81,31 +81,34 @@ func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof []
 func (a *app) failAttempt(ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		a.say("traversal failed")
-		a.markPhase(phaseLobby)
+		if a.registry == nil || a.registry.Len() == 0 {
+			a.markPhase(phaseLobby)
+		}
 	}
 	return nil
 }
 
-func (a *app) chatting() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.inChat
+func (a *app) chatting(id string) bool {
+	if a.registry == nil {
+		return false
+	}
+	return a.registry.Has(ConvID(id))
 }
 
-func (a *app) waitConnected(ctx context.Context, d time.Duration) bool {
+func (a *app) waitConnected(ctx context.Context, d time.Duration, id string) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if a.chatting() {
+		if a.chatting(id) {
 			return true
 		}
 		select {
 		case <-ctx.Done():
-			return a.chatting()
+			return a.chatting(id)
 		case <-timer.C:
-			return a.chatting()
+			return a.chatting(id)
 		case <-tick.C:
 		}
 	}
@@ -124,7 +127,7 @@ func (a *app) dialDirect(ctx context.Context, addr, id, caller, target string, p
 		return false
 	}
 	a.say(connectedPrompt(true))
-	if !a.beginChat(c, sess, true, addr) {
+	if !a.beginChat(c, sess, true, addr, ConvID(id), target) {
 		_ = c.Close(websocket.StatusNormalClosure, "")
 	}
 	return true
@@ -175,7 +178,7 @@ func (a *app) postTicket(ctx context.Context, id, ticket string) string {
 }
 
 func (a *app) punchPath(ctx context.Context, id, caller, target string, proof []byte, dialer bool) {
-	if a.chatting() {
+	if a.chatting(id) {
 		return
 	}
 	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
@@ -201,7 +204,7 @@ func (a *app) punchPath(ctx context.Context, id, caller, target string, proof []
 	tick := time.NewTicker(punchEvery)
 	defer tick.Stop()
 	for peer == "" {
-		if a.chatting() || ctx.Err() != nil {
+		if a.chatting(id) || ctx.Err() != nil {
 			return
 		}
 		_, _ = conn.WriteToUDP(ticket, dest)
@@ -256,7 +259,7 @@ func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAdd
 	tick := time.NewTicker(punchEvery)
 	defer tick.Stop()
 	for {
-		if a.chatting() || ctx.Err() != nil {
+		if a.chatting(id) || ctx.Err() != nil {
 			return false
 		}
 		if _, err := conn.WriteToUDP(msg, remote); err != nil {
@@ -277,7 +280,7 @@ func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAdd
 		if err != nil {
 			continue
 		}
-		if a.beginChat(link, sess, true, remote.String()) {
+		if a.beginChat(link, sess, true, remote.String(), ConvID(id), target) {
 			a.say(connectedPrompt(true))
 			return true
 		}
@@ -289,7 +292,7 @@ func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPA
 	link := &udpLink{conn: conn, peer: remote}
 	var cache offerCache
 	for {
-		if a.chatting() || ctx.Err() != nil {
+		if a.chatting(id) || ctx.Err() != nil {
 			return false
 		}
 		_, msg, err := link.Read(ctx)
@@ -306,7 +309,7 @@ func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPA
 		if reused || sess == nil {
 			continue
 		}
-		if a.beginChat(link, sess, false, remote.String()) {
+		if a.beginChat(link, sess, false, remote.String(), ConvID(id), caller) {
 			a.say("\n" + connectedPrompt(false))
 			return true
 		}
@@ -346,7 +349,7 @@ func (a *app) acceptDirect(msg []byte, id, caller, target string, proof []byte) 
 }
 
 func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []byte, dialer bool) {
-	if a.chatting() {
+	if a.chatting(id) {
 		return
 	}
 	var d net.Dialer
@@ -380,7 +383,7 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []
 		if err != nil {
 			return
 		}
-		if a.beginChat(link, sess, true, "") {
+		if a.beginChat(link, sess, true, "", ConvID(id), target) {
 			owned = false
 			a.say(connectedPrompt(true))
 		}
@@ -397,7 +400,7 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []
 	if err := link.Write(ctx, websocket.MessageBinary, reply); err != nil {
 		return
 	}
-	if a.beginChat(link, sess, false, "") {
+	if a.beginChat(link, sess, false, "", ConvID(id), caller) {
 		owned = false
 		a.say("\n" + connectedPrompt(false))
 	}

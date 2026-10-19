@@ -46,22 +46,16 @@ type app struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 
-	mu          sync.Mutex
-	presence    string
-	inChat      bool
-	chatConn    byteConn
-	sess        *session.Session
-	dialer      bool
-	peerAddr    string
-	quitting    bool
-	resumeUntil time.Time
-	queued      []string
-	fromKey     map[string]string
-	gate        Gate
-	punchAddr   string
-	relayAddr   string
-	out         io.Writer
-	deskCh      chan tea.Msg
+	mu        sync.Mutex
+	presence  string
+	fromKey   map[string]string
+	gate      Gate
+	registry  *Registry
+	maxChats  int
+	punchAddr string
+	relayAddr string
+	out       io.Writer
+	deskCh    chan tea.Msg
 }
 
 func main() {
@@ -125,8 +119,11 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		fromKey:      map[string]string{},
 		punchAddr:    cfg.punch,
 		relayAddr:    cfg.relay,
+		maxChats:     cfg.maxChats,
 	}
+	a.initRegistry()
 	a.gate.readable = a.requestReadable
+	go a.pumpEvents()
 	go a.serveWS()
 	if err := a.register("available"); err != nil {
 		return err
@@ -142,7 +139,7 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	}
 
 	fmt.Println("commands: lookup <key> | connect <key> | accept <id> | reject <id> | quit")
-	fmt.Println("(in chat: just type messages; /quit leaves chat)")
+	fmt.Println("(in chat: type messages; /chats /focus /quit; lobby verbs still work)")
 
 	sc := bufio.NewScanner(stdin)
 	for sc.Scan() {
@@ -161,49 +158,105 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 }
 
 func (a *app) handleLine(line string) error {
-	a.mu.Lock()
-	chatting := a.inChat
-	conn := a.chatConn
-	sess := a.sess
-	a.mu.Unlock()
-
-	if chatting {
-		if line == "/quit" {
-			a.quitChat()
-			return nil
-		}
-		if conn == nil {
-			a.mu.Lock()
-			a.queued = append(a.queued, line)
-			a.mu.Unlock()
-			return nil
-		}
-		frame, err := session.Seal(sess, line, session.Highest(sess))
-		if err != nil {
+	a.initRegistry()
+	if cmd, ok := parseChatCommand(line); ok {
+		return a.dispatchChatCommand(cmd)
+	}
+	verb, rest, lobby := parseLobbyVerb(line)
+	if lobby {
+		return a.handleLobbyVerb(verb, rest)
+	}
+	if focused, ok := a.registry.Focused(); ok {
+		if err := focused.SendText(line); err != nil {
 			a.println("send failed:", err)
-			return nil
-		}
-		if err := conn.Write(a.ctx, websocket.MessageBinary, frame); err != nil {
-			a.println("send failed:", err)
-			return nil
-		}
-		if a.deskCh != nil {
-			a.note(note{kind: noteSelf, text: line})
 		}
 		return nil
 	}
+	a.println("unknown command")
+	return nil
+}
 
+func parseChatCommand(line string) (chatCommand, bool) {
 	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return chatCommand{}, false
+	}
 	switch parts[0] {
+	case "/chats":
+		return chatCommand{kind: chatCmdChats}, true
+	case "/focus":
+		ref := ""
+		if len(parts) > 1 {
+			ref = parts[1]
+		}
+		return chatCommand{kind: chatCmdFocus, ref: ref}, true
+	case "/quit":
+		return chatCommand{kind: chatCmdQuit}, true
+	default:
+		return chatCommand{}, false
+	}
+}
+
+func parseLobbyVerb(line string) (string, []string, bool) {
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return "", nil, false
+	}
+	switch parts[0] {
+	case "quit", "exit", "lookup", "connect", "accept", "reject":
+		return parts[0], parts[1:], true
+	default:
+		return "", nil, false
+	}
+}
+
+type chatCmdKind uint8
+
+const (
+	chatCmdChats chatCmdKind = iota
+	chatCmdFocus
+	chatCmdQuit
+)
+
+type chatCommand struct {
+	kind chatCmdKind
+	ref  string
+}
+
+func (a *app) dispatchChatCommand(cmd chatCommand) error {
+	switch cmd.kind {
+	case chatCmdChats:
+		lines := a.registry.StatusLines()
+		if len(lines) == 0 {
+			a.println("(no chats)")
+			break
+		}
+		for _, line := range lines {
+			a.println(line)
+		}
+	case chatCmdFocus:
+		if err := a.registry.FocusRef(cmd.ref); err != nil {
+			a.println("focus error:", err)
+		}
+	case chatCmdQuit:
+		if c, ok := a.registry.Focused(); ok {
+			c.Quit()
+		}
+	}
+	return nil
+}
+
+func (a *app) handleLobbyVerb(verb string, rest []string) error {
+	switch verb {
 	case "quit", "exit":
 		a.cancel()
 		return errStop
 	case "lookup":
-		if len(parts) < 2 {
+		if len(rest) < 1 {
 			a.println("usage: lookup <key>")
 			return nil
 		}
-		p, err := a.lookup(parts[1])
+		p, err := a.lookup(rest[0])
 		if err != nil {
 			a.println("lookup error:", err)
 			return nil
@@ -214,26 +267,31 @@ func (a *app) handleLine(line string) error {
 			fmt.Printf("peer: %+v\n", p)
 		}
 	case "connect":
-		if len(parts) < 2 {
+		if len(rest) < 1 {
 			a.println("usage: connect <key>")
 			return nil
 		}
-		if err := a.doConnect(parts[1]); err != nil {
+		if a.registry.AtCapacity() {
+			a.println("at capacity")
+			a.markPhase(phaseLobby)
+			return nil
+		}
+		if err := a.doConnect(rest[0]); err != nil {
 			a.println("connect error:", err)
 			a.markPhase(phaseLobby)
 		}
 	case "accept":
-		if len(parts) < 2 {
+		if len(rest) < 1 {
 			a.println("usage: accept <request-id>")
 			return nil
 		}
-		_ = a.acceptRequest(parts[1])
+		_ = a.acceptRequest(rest[0])
 	case "reject":
-		if len(parts) < 2 {
+		if len(rest) < 1 {
 			a.println("usage: reject <request-id>")
 			return nil
 		}
-		_ = a.rejectRequest(parts[1])
+		_ = a.rejectRequest(rest[0])
 	default:
 		a.println("unknown command")
 	}
@@ -241,26 +299,6 @@ func (a *app) handleLine(line string) error {
 }
 
 var errStop = errors.New("stop")
-
-func (a *app) quitChat() {
-	a.mu.Lock()
-	a.quitting = true
-	conn := a.chatConn
-	sess := a.sess
-	a.inChat = false
-	a.chatConn = nil
-	a.queued = nil
-	a.resumeUntil = time.Time{}
-	a.mu.Unlock()
-	if sess != nil && conn != nil {
-		if frame, err := session.End(sess); err == nil {
-			_ = conn.Write(a.ctx, websocket.MessageBinary, frame)
-		}
-		_ = conn.Close(websocket.StatusNormalClosure, "")
-	}
-	a.println("left chat")
-	a.markPhase(phaseLobby)
-}
 
 func (a *app) drain(body io.ReadCloser) {
 	if body == nil {
@@ -431,6 +469,10 @@ func (a *app) postAction(id, action string) (string, error) {
 }
 
 func (a *app) doConnect(target string) error {
+	a.initRegistry()
+	if a.registry.AtCapacity() {
+		return ErrAtCapacity
+	}
 	p, err := a.lookup(target)
 	if err != nil {
 		return err
@@ -525,26 +567,24 @@ func (a *app) serveWS() {
 }
 
 func (a *app) onIncoming(c byteConn) {
-	a.mu.Lock()
-	if a.chatConn != nil {
-		a.mu.Unlock()
-		_ = c.Close(websocket.StatusPolicyViolation, "")
-		return
-	}
-	until := a.resumeUntil
-	a.mu.Unlock()
+	a.initRegistry()
 	var admitted bool
 	ready := func(sess *session.Session) {
 		admitted = true
-		if a.beginChat(c, sess, false, "") {
+		id := a.gate.idOf(sess)
+		peer := a.callerFor(id)
+		if a.beginChat(c, sess, false, "", ConvID(id), peer) {
 			a.say("\n" + connectedPrompt(false))
+			return
 		}
+		_ = c.Close(websocket.StatusPolicyViolation, "at capacity")
 	}
-	sess, err := a.gate.take(a.ctx, c, time.Now(), until, ready)
+	sess, err := a.gate.take(a.ctx, c, time.Now(), time.Time{}, ready)
 	if err != nil || admitted || sess == nil {
 		return
 	}
-	a.resumeAttached(c, sess)
+	id := a.gate.idOf(sess)
+	_ = a.registry.DeliverResume(ConvID(id), c, sess)
 }
 
 func (a *app) say(args ...any) {
@@ -583,101 +623,79 @@ func (a *app) callerFor(id string) string {
 	return body.From
 }
 
-func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr string) bool {
-	a.mu.Lock()
-	if a.inChat {
-		a.mu.Unlock()
+func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr string, id ConvID, peer string) bool {
+	a.initRegistry()
+	_, err := a.registry.Attach(AttachReq{
+		ID:     id,
+		Peer:   peer,
+		Sess:   sess,
+		Conn:   c,
+		Dialer: dialer,
+		Addr:   addr,
+	})
+	if err != nil {
 		return false
 	}
-	a.inChat = true
-	a.chatConn = c
-	a.sess = sess
-	a.dialer = dialer
-	a.peerAddr = addr
-	a.quitting = false
-	a.resumeUntil = time.Time{}
-	a.mu.Unlock()
-	go a.chatLoop(c)
 	a.markPhase(phaseChat)
 	return true
 }
 
-func (a *app) resumeAttached(c byteConn, sess *session.Session) {
-	a.mu.Lock()
-	a.inChat = true
-	a.chatConn = c
-	a.sess = sess
-	a.resumeUntil = time.Time{}
-	a.mu.Unlock()
-	a.markPhase(phaseChat)
-	go a.chatLoop(c)
+func (a *app) initRegistry() {
+	if a.registry != nil {
+		return
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	max := a.maxChats
+	if max < 1 {
+		max = 4
+	}
+	a.registry = NewRegistry(ctx, max, a.resumeWindow)
+	a.gate.until = a.registry.ResumeUntil
 }
 
-func (a *app) chatLoop(c byteConn) {
+func (a *app) pumpEvents() {
+	if a.registry == nil {
+		return
+	}
 	for {
-		if !a.readLoop(c) {
+		select {
+		case <-a.ctx.Done():
 			return
-		}
-		a.mu.Lock()
-		dialer := a.dialer
-		addr := a.peerAddr
-		until := a.resumeUntil
-		a.mu.Unlock()
-		if !dialer {
-			a.watchResume(until)
-			return
-		}
-		next, ok := a.retryDial(addr)
-		if !ok {
-			return
-		}
-		c = next
-	}
-}
-
-func (a *app) readLoop(c byteConn) bool {
-	for {
-		_, data, err := c.Read(a.ctx)
-		if err != nil {
-			a.mu.Lock()
-			quit := a.quitting
-			current := a.chatConn == c || a.chatConn == nil
-			a.mu.Unlock()
-			if quit || !current {
-				return false
+		case ev, ok := <-a.registry.Events():
+			if !ok {
+				return
 			}
-			return a.armBreak(c)
-		}
-		a.mu.Lock()
-		sess := a.sess
-		quit := a.quitting
-		a.mu.Unlock()
-		text, display, openErr := session.Open(sess, data)
-		if openErr != nil {
-			a.tellFinished(c, sess)
-			a.endSession(quit)
-			return false
-		}
-		if session.Finished(sess) {
-			a.endSession(quit)
-			return false
-		}
-		if display {
-			if a.deskCh != nil {
-				a.note(note{kind: notePeer, text: text})
-			} else {
-				fmt.Printf("peer: %s\n> ", text)
-			}
+			a.handleConvEvent(ev)
 		}
 	}
 }
 
-func (a *app) tellFinished(c byteConn, sess *session.Session) {
-	if frame := session.FailureNotice(sess); len(frame) > 0 && c != nil {
-		_ = c.Write(a.ctx, websocket.MessageBinary, frame)
-	}
-	if c != nil {
-		_ = c.CloseNow()
+func (a *app) handleConvEvent(ev ConvEvent) {
+	switch ev.Kind {
+	case EvPeerLine:
+		if a.deskCh != nil {
+			a.note(note{kind: notePeer, text: ev.Text, id: string(ev.ID), key: ev.Peer})
+		} else {
+			fmt.Printf("peer: %s\n> ", ev.Text)
+		}
+	case EvSelfLine:
+		if a.deskCh != nil {
+			a.note(note{kind: noteSelf, text: ev.Text, id: string(ev.ID), key: ev.Peer})
+		}
+	case EvEnded:
+		if ev.Text == "quit" {
+			a.println("left chat")
+		} else {
+			a.println("\nchat ended")
+		}
+		if a.registry.Len() == 0 {
+			a.markPhase(phaseLobby)
+		} else {
+			a.markPhase(phaseChat)
+		}
 	}
 }
 
@@ -697,118 +715,4 @@ func (a *app) requestReadable(id string) bool {
 		return false
 	}
 	return status.Status == "accepted"
-}
-
-func (a *app) endSession(quit bool) {
-	a.mu.Lock()
-	a.inChat = false
-	a.chatConn = nil
-	a.resumeUntil = time.Time{}
-	a.mu.Unlock()
-	if !quit {
-		a.showEnded()
-	}
-}
-
-func (a *app) armBreak(c byteConn) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.quitting {
-		return false
-	}
-	if a.sess != nil && session.Finished(a.sess) {
-		a.inChat = false
-		a.chatConn = nil
-		a.mu.Unlock()
-		a.showEnded()
-		a.mu.Lock()
-		return false
-	}
-	if a.chatConn != nil && a.chatConn != c {
-		return false
-	}
-	a.chatConn = nil
-	a.resumeUntil = time.Now().Add(a.resumeWindow)
-	return true
-}
-
-func (a *app) watchResume(until time.Time) {
-	timer := time.NewTimer(time.Until(until))
-	defer timer.Stop()
-	select {
-	case <-a.ctx.Done():
-		return
-	case <-timer.C:
-		a.mu.Lock()
-		if a.quitting || a.chatConn != nil || !a.resumeUntil.Equal(until) {
-			a.mu.Unlock()
-			return
-		}
-		a.inChat = false
-		a.resumeUntil = time.Time{}
-		a.mu.Unlock()
-		a.showEnded()
-	}
-}
-
-func (a *app) retryDial(addr string) (byteConn, bool) {
-	for {
-		a.mu.Lock()
-		until := a.resumeUntil
-		quit := a.quitting
-		sess := a.sess
-		a.mu.Unlock()
-		if quit || sess == nil {
-			return nil, false
-		}
-		if !time.Now().Before(until) {
-			a.expireResume()
-			return nil, false
-		}
-		time.Sleep(time.Second)
-		a.mu.Lock()
-		until = a.resumeUntil
-		quit = a.quitting
-		sess = a.sess
-		lines := append([]string(nil), a.queued...)
-		a.mu.Unlock()
-		if quit || sess == nil {
-			return nil, false
-		}
-		if !time.Now().Before(until) {
-			a.expireResume()
-			return nil, false
-		}
-		c, _, err := websocket.Dial(a.ctx, "ws://"+addr, nil)
-		if err != nil {
-			continue
-		}
-		err = pushResume(a.ctx, c, sess, time.Now(), until, lines)
-		if err != nil {
-			_ = c.Close(websocket.StatusPolicyViolation, "")
-			continue
-		}
-		a.mu.Lock()
-		if len(a.queued) >= len(lines) {
-			a.queued = append([]string(nil), a.queued[len(lines):]...)
-		} else {
-			a.queued = nil
-		}
-		a.chatConn = c
-		a.resumeUntil = time.Time{}
-		a.mu.Unlock()
-		return c, true
-	}
-}
-
-func (a *app) expireResume() {
-	a.mu.Lock()
-	if a.quitting || a.chatConn != nil {
-		a.mu.Unlock()
-		return
-	}
-	a.inChat = false
-	a.resumeUntil = time.Time{}
-	a.mu.Unlock()
-	a.showEnded()
 }

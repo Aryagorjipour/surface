@@ -147,13 +147,9 @@ func TestHeartbeatRepeatsPresence(t *testing.T) {
 			t.Fatalf("auth %q", auth)
 		}
 	}
-	a.inChat = true
 	a.base = "http://127.0.0.1:1"
 	if err := a.heartbeatOnce(); err == nil {
 		t.Fatal("expected refresh error")
-	}
-	if !a.inChat || a.chatConn != nil {
-		t.Fatal("failed refresh changed the chat")
 	}
 }
 
@@ -382,6 +378,97 @@ func TestMaxChatsConfig(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "SURFACE_MAX_CHATS not a positive integer") {
 		t.Fatalf("env zero: %v", err)
+	}
+}
+
+func TestConnectSkippedAtCapacity(t *testing.T) {
+	var connects int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/connect" {
+			connects++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{
+		base:     srv.URL,
+		myKey:    "bob",
+		token:    "dev",
+		ctx:      ctx,
+		cancel:   cancel,
+		maxChats: 1,
+	}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	if err := a.handleLine("connect carol"); err != nil {
+		t.Fatal(err)
+	}
+	if connects != 0 {
+		t.Fatalf("connect posted %d times", connects)
+	}
+}
+
+func TestAcceptSkippedAtCapacity(t *testing.T) {
+	var accepts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			accepts++
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{base: srv.URL, token: "dev", ctx: ctx, cancel: cancel, maxChats: 1}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	if err := a.handleLine("accept req-b"); err != nil {
+		t.Fatal(err)
+	}
+	if accepts != 0 {
+		t.Fatalf("accept posted %d times", accepts)
+	}
+}
+
+func TestAcceptWhileFocusedHitsConnector(t *testing.T) {
+	var accepts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			accepts++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{base: srv.URL, token: "dev", ctx: ctx, cancel: cancel, maxChats: 4}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	_ = a.handleLine("accept req-b")
+	if accepts != 1 {
+		t.Fatalf("accept posted %d times", accepts)
+	}
+}
+
+func TestHandleLineQuitEndsOnlyFocused(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{ctx: ctx, cancel: cancel, maxChats: 4, resumeWindow: time.Minute}
+	a.initRegistry()
+	go a.pumpEvents()
+	first := attachPipe(t, a.registry, "req-a", "alice")
+	second := attachPipe(t, a.registry, "req-b", "bob")
+	if err := a.handleLine("/quit"); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, a.registry, second.ID())
+	if !a.registry.Has(first.ID()) {
+		t.Fatal("quit closed the unfocused conversation")
 	}
 }
 

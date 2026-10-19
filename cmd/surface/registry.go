@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +25,8 @@ var (
 	ErrAtCapacity      = errors.New("max concurrent chats reached")
 	ErrAlreadyAttached = errors.New("conversation already attached")
 	ErrUnknownConv     = errors.New("unknown conversation")
-	ErrNoFocus         = errors.New("no focused conversation")
 )
 
-// Registry is the process map of conversation actors and the input-focus pointer.
 type Registry struct {
 	mu     sync.Mutex
 	byID   map[ConvID]*Conversation
@@ -57,7 +56,6 @@ func NewRegistry(parent context.Context, maxChats int, resumeWindow time.Duratio
 	}
 }
 
-// Attach spawns a conversation actor. A new attach takes focus. Existing actors keep running.
 func (r *Registry) Attach(req AttachReq) (*Conversation, error) {
 	if req.ID == "" || req.Sess == nil || req.Conn == nil {
 		return nil, errors.New("invalid attach")
@@ -230,11 +228,16 @@ func (r *Registry) StatusLines() []string {
 		if r.focus.set && r.focus.id == id {
 			mark = " *"
 		}
+		resume, unread := c.statusBits()
 		state := "live"
-		if c.inResume() {
+		if resume {
 			state = "resume"
 		}
-		out = append(out, mark+" "+string(id)+" "+c.peer+" "+state)
+		line := mark + " " + string(id) + " " + c.peer + " " + state
+		if unread > 0 {
+			line += " " + strconv.Itoa(unread)
+		}
+		out = append(out, line)
 	}
 	sort.Strings(out)
 	return out

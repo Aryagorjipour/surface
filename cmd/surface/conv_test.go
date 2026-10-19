@@ -311,7 +311,7 @@ func TestFailedOpenEndsBothSides(t *testing.T) {
 func TestNetworkCloseStillResumes(t *testing.T) {
 	dialer, _, client, server := handshakePair(t, "req-net")
 	r := testRegistry(t, 4)
-	if _, err := r.Attach(AttachReq{ID: "req-net", Peer: "peer", Sess: dialer, Conn: client, Dialer: true, Addr: "127.0.0.1:1"}); err != nil {
+	if _, err := r.Attach(AttachReq{ID: "req-net", Peer: "peer", Sess: dialer, Conn: client, Dialer: true}); err != nil {
 		t.Fatal(err)
 	}
 	_ = server.Close(websocket.StatusGoingAway, "")

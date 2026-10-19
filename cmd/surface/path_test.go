@@ -413,8 +413,11 @@ func startPathSurface(t *testing.T, base, token, key, punch, relay string) *path
 		punchAddr:    punch,
 		relayAddr:    relay,
 		out:          buf,
+		maxChats:     4,
 	}
+	a.initRegistry()
 	a.gate.readable = a.requestReadable
+	go a.pumpEvents()
 	go a.serveWS()
 	waitPathListen(t, addr)
 	if err := a.register("available"); err != nil {
@@ -607,10 +610,10 @@ func exchangePath(t *testing.T, dialer, listener *app) string {
 	t.Helper()
 	return captureStdout(t, func() {
 		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) && (!dialer.chatting() || !listener.chatting()) {
+		for time.Now().Before(deadline) && (dialer.registry.Len() == 0 || listener.registry.Len() == 0) {
 			time.Sleep(10 * time.Millisecond)
 		}
-		if !dialer.chatting() || !listener.chatting() {
+		if dialer.registry.Len() == 0 || listener.registry.Len() == 0 {
 			t.Fatal("not chatting")
 		}
 		if err := dialer.handleLine("surface-round-trip"); err != nil {
