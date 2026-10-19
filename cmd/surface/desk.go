@@ -47,7 +47,15 @@ func lineText(args ...any) string {
 
 func (a *app) println(args ...any) {
 	if a != nil && a.deskCh != nil {
-		a.note(note{kind: noteText, text: lineText(args...)})
+		a.note(note{kind: noteToast, level: toastWarn, text: lineText(args...)})
+		return
+	}
+	fmt.Println(args...)
+}
+
+func (a *app) toast(level toastLevel, args ...any) {
+	if a != nil && a.deskCh != nil {
+		a.note(note{kind: noteToast, level: level, text: lineText(args...)})
 		return
 	}
 	fmt.Println(args...)
@@ -55,7 +63,7 @@ func (a *app) println(args ...any) {
 
 func (a *app) serveDesk(in io.Reader, out io.Writer) error {
 	s := newScreen(a)
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}
 	if f, ok := in.(*os.File); ok {
 		opts = append(opts, tea.WithInput(f))
 	}
