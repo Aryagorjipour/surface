@@ -252,7 +252,6 @@ func TestPathHarnesses(t *testing.T) {
 		go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
 		id := waitPathPending(t, base, token, listener.app.myKey)
 		listener.lastID = id
-		// The dialer sleeps before its first status read, so this accept lands in that sleep.
 		time.Sleep(30 * time.Millisecond)
 		if err := listener.app.handleLine("accept " + id); err != nil {
 			t.Fatal(err)

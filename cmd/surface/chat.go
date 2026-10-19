@@ -20,7 +20,6 @@ func connectedPrompt(dialer bool) string {
 	return ">>> peer connected — type messages (/quit to leave)"
 }
 
-// Gate spends each request id once. It does not cap how many ids may be live.
 type Gate struct {
 	mu       sync.Mutex
 	live     map[string]*session.Session
@@ -118,7 +117,6 @@ func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, reque
 	return nil
 }
 
-// take reads the first frame. An admission calls ready. A resume does not.
 func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time, ready func(*session.Session)) (*session.Session, error) {
 	_, msg, err := conn.Read(ctx)
 	if err != nil {
@@ -214,7 +212,6 @@ func resumeID(msg []byte) (string, uint64, uint64, []byte, error) {
 	return splitResumeLocal(msg)
 }
 
-// pushResume sends a resume offer, accepts the reply, then seals lines in order.
 func pushResume(ctx context.Context, conn byteConn, sess *session.Session, now, deadline time.Time, lines []string) error {
 	offer, err := session.ResumeOffer(sess)
 	if err != nil {

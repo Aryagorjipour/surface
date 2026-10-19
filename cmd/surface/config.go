@@ -13,7 +13,6 @@ import (
 	"time"
 )
 
-// errHelp asks main to print help and exit success.
 var errHelp = errors.New("help")
 
 type surfaceConfig struct {

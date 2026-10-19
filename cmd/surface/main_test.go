@@ -16,7 +16,6 @@ import (
 	"time"
 )
 
-// lockedBuffer lets a test read slog output while a heartbeat goroutine writes it.
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

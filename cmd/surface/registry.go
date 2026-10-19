@@ -13,7 +13,6 @@ import (
 	"github.com/coder/websocket"
 )
 
-// ConvID is a Connector request_id. One actor per id for the life of that chat.
 type ConvID string
 
 type convFocus struct {
@@ -91,7 +90,6 @@ func (r *Registry) Attach(req AttachReq) (*Conversation, error) {
 	return c, nil
 }
 
-// Focus changes only the pointer. It never closes a carrier or emits EvEnded.
 func (r *Registry) Focus(id ConvID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -182,8 +180,6 @@ func (r *Registry) IDForPeer(peer string) ConvID {
 	return ""
 }
 
-// ExpectingResume reports whether any actor is in a resume gap.
-// Callers must not use this to peek frames; Gate.take still runs first.
 func (r *Registry) ExpectingResume() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()

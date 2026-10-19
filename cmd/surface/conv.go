@@ -31,7 +31,6 @@ type carrierGone struct{}
 
 func (carrierGone) carrierState() {}
 
-// Conversation is one owned chat actor. Callers never touch conn, sess, or queue.
 type Conversation struct {
 	id     ConvID
 	peer   string
@@ -558,7 +557,6 @@ const (
 	EvResumed
 )
 
-// ConvEvent is the read-side merge into UI and piped output.
 type ConvEvent struct {
 	ID   ConvID
 	Peer string

@@ -330,7 +330,6 @@ func TestChatResumeSkipsPrompt(t *testing.T) {
 		})
 		errCh <- err
 	}()
-	// take() on an admission needs the invite path. Use accept through take by dialing.
 	dialer, err := g.dialAdmitted(ctx, client, id, caller, target, raw)
 	if err != nil {
 		t.Fatal(err)

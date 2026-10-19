@@ -27,10 +27,6 @@ func setAttemptBudget(d time.Duration) { attemptBudget = d }
 
 func setDialTimeout(d time.Duration) { dialTimeout = d }
 
-// attempt dials the registered address first. Punch runs to completion before
-// a relay socket opens. The listener keeps the WebSocket accept loop running
-// beside whichever fallback is active. The dialer's bound starts from the
-// accept response, which can be one poll older than this call.
 func (a *app) attempt(dialer bool, addr, id, caller, target string, proof []byte) error {
 	budget := attemptBudget
 	if dialer && acceptPoll < budget {
@@ -222,9 +218,6 @@ func (a *app) punchPath(ctx context.Context, id, caller, target string, proof []
 	if err != nil {
 		return
 	}
-	// Ticket posts use the attempt context until a peer is known. The datagram
-	// exchange stops at half of the time still left when a relay is set, so
-	// that relay can run before the budget ends.
 	handCtx, stop := a.datagramCtx(ctx)
 	defer stop()
 	if dialer {
