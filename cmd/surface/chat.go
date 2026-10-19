@@ -20,12 +20,12 @@ func connectedPrompt(dialer bool) string {
 	return ">>> peer connected — type messages (/quit to leave)"
 }
 
-// Gate admits one direct chat and spends each request id once.
 type Gate struct {
 	mu       sync.Mutex
 	live     map[string]*session.Session
 	invites  map[string]invite
 	readable func(requestID string) bool
+	until    func(requestID string) time.Time
 }
 
 type invite struct {
@@ -47,6 +47,17 @@ func (g *Gate) session(requestID string) *session.Session {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.live[requestID]
+}
+
+func (g *Gate) idOf(sess *session.Session) string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id, s := range g.live {
+		if s == sess {
+			return id
+		}
+	}
+	return ""
 }
 
 func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
@@ -106,7 +117,6 @@ func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, reque
 	return nil
 }
 
-// take reads the first frame. An admission calls ready. A resume does not.
 func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time, ready func(*session.Session)) (*session.Session, error) {
 	_, msg, err := conn.Read(ctx)
 	if err != nil {
@@ -139,7 +149,13 @@ func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time,
 			return nil, err
 		}
 		sess := g.session(id)
-		reply, err := session.AcceptResume(sess, msg, now, deadline)
+		d := deadline
+		if g.until != nil {
+			if u := g.until(id); !u.IsZero() {
+				d = u
+			}
+		}
+		reply, err := session.AcceptResume(sess, msg, now, d)
 		if err != nil {
 			recordRefused(ctx)
 			_ = conn.Close(websocket.StatusPolicyViolation, "")
@@ -196,7 +212,6 @@ func resumeID(msg []byte) (string, uint64, uint64, []byte, error) {
 	return splitResumeLocal(msg)
 }
 
-// pushResume sends a resume offer, accepts the reply, then seals lines in order.
 func pushResume(ctx context.Context, conn byteConn, sess *session.Session, now, deadline time.Time, lines []string) error {
 	offer, err := session.ResumeOffer(sess)
 	if err != nil {

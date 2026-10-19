@@ -252,7 +252,6 @@ func TestPathHarnesses(t *testing.T) {
 		go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
 		id := waitPathPending(t, base, token, listener.app.myKey)
 		listener.lastID = id
-		// The dialer sleeps before its first status read, so this accept lands in that sleep.
 		time.Sleep(30 * time.Millisecond)
 		if err := listener.app.handleLine("accept " + id); err != nil {
 			t.Fatal(err)
@@ -413,8 +412,11 @@ func startPathSurface(t *testing.T, base, token, key, punch, relay string) *path
 		punchAddr:    punch,
 		relayAddr:    relay,
 		out:          buf,
+		maxChats:     4,
 	}
+	a.initRegistry()
 	a.gate.readable = a.requestReadable
+	go a.pumpEvents()
 	go a.serveWS()
 	waitPathListen(t, addr)
 	if err := a.register("available"); err != nil {
@@ -607,10 +609,10 @@ func exchangePath(t *testing.T, dialer, listener *app) string {
 	t.Helper()
 	return captureStdout(t, func() {
 		deadline := time.Now().Add(time.Second)
-		for time.Now().Before(deadline) && (!dialer.chatting() || !listener.chatting()) {
+		for time.Now().Before(deadline) && (dialer.registry.Len() == 0 || listener.registry.Len() == 0) {
 			time.Sleep(10 * time.Millisecond)
 		}
-		if !dialer.chatting() || !listener.chatting() {
+		if dialer.registry.Len() == 0 || listener.registry.Len() == 0 {
 			t.Fatal("not chatting")
 		}
 		if err := dialer.handleLine("surface-round-trip"); err != nil {

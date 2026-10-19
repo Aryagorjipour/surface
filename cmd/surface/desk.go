@@ -53,19 +53,6 @@ func (a *app) println(args ...any) {
 	fmt.Println(args...)
 }
 
-func (a *app) showEnded() {
-	a.toast(toastInfo, "chat ended")
-	a.markPhase(phaseLobby)
-}
-
-func (a *app) toast(level toastLevel, args ...any) {
-	if a != nil && a.deskCh != nil {
-		a.note(note{kind: noteToast, level: level, text: lineText(args...)})
-		return
-	}
-	fmt.Println(args...)
-}
-
 func (a *app) serveDesk(in io.Reader, out io.Writer) error {
 	s := newScreen(a)
 	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}
@@ -89,6 +76,11 @@ func (a *app) acceptRequest(id string) error {
 	if id == "" {
 		a.println("usage: accept <request-id>")
 		return errors.New("usage")
+	}
+	a.initRegistry()
+	if a.registry.AtCapacity() {
+		a.println("at capacity")
+		return ErrAtCapacity
 	}
 	proofText, err := a.postAction(id, "accept")
 	if err != nil {

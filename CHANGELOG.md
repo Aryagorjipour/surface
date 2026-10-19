@@ -4,6 +4,7 @@
 
 ### Added
 
+- One Surface can keep several direct chats at once. `--max-chats` / `SURFACE_MAX_CHATS` sets the ceiling (default 4). `/focus` and `/chats` switch among live conversations without closing inactive sockets.
 - Surface desk shows system and connection events as timed toasts instead of transcript lines.
 - Surface desk supports mouse wheel scroll and click to focus panes, select peers, and dismiss toasts.
 - Surface desk uses Lip Gloss styling for pane titles, chat roles, status, compose, and toast overlays.

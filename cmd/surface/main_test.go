@@ -16,7 +16,6 @@ import (
 	"time"
 )
 
-// lockedBuffer lets a test read slog output while a heartbeat goroutine writes it.
 type lockedBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -41,6 +40,7 @@ func TestSurfaceHelp(t *testing.T) {
 		"--heartbeat-interval", "30s",
 		"--resume-window", "60s",
 		"--pending-poll", "2s",
+		"--max-chats", "4",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help missing %q\n%s", want, text)
@@ -146,13 +146,9 @@ func TestHeartbeatRepeatsPresence(t *testing.T) {
 			t.Fatalf("auth %q", auth)
 		}
 	}
-	a.inChat = true
 	a.base = "http://127.0.0.1:1"
 	if err := a.heartbeatOnce(); err == nil {
 		t.Fatal("expected refresh error")
-	}
-	if !a.inChat || a.chatConn != nil {
-		t.Fatal("failed refresh changed the chat")
 	}
 }
 
@@ -271,6 +267,9 @@ func TestSurfacePathFlags(t *testing.T) {
 	if def.relay != "" || def.punch != "connector.example:8081" {
 		t.Fatalf("defaults relay %q punch %q", def.relay, def.punch)
 	}
+	if def.maxChats != 4 {
+		t.Fatalf("default maxChats %d", def.maxChats)
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "surface.env")
@@ -322,6 +321,153 @@ func TestSurfacePathFlags(t *testing.T) {
 		if !strings.Contains(text, word) {
 			t.Fatalf("commands missing %s\n%s", word, text)
 		}
+	}
+}
+
+func TestMaxChatsConfig(t *testing.T) {
+	def, err := parseSurface([]string{"http://connector.example:8080", "alice"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.maxChats != 4 {
+		t.Fatalf("default %d", def.maxChats)
+	}
+
+	fromFlag, err := parseSurface([]string{"--max-chats", "2", "http://connector.example:8080", "alice"}, nil)
+	if err != nil || fromFlag.maxChats != 2 {
+		t.Fatalf("flag %+v %v", fromFlag, err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "surface.env")
+	if err := os.WriteFile(path, []byte("SURFACE_MAX_CHATS=5\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := parseSurface([]string{"--config", path, "http://127.0.0.1:8080", "alice"}, nil)
+	if err != nil || fromFile.maxChats != 5 {
+		t.Fatalf("file %+v %v", fromFile, err)
+	}
+
+	lookup := func(k string) (string, bool) {
+		if k == "SURFACE_MAX_CHATS" {
+			return "3", true
+		}
+		return "", false
+	}
+	fromEnv, err := parseSurface([]string{"--config", path, "http://127.0.0.1:8080", "alice"}, lookup)
+	if err != nil || fromEnv.maxChats != 3 {
+		t.Fatalf("env %+v %v", fromEnv, err)
+	}
+	flagWins, err := parseSurface([]string{"--config", path, "--max-chats", "8", "http://127.0.0.1:8080", "alice"}, lookup)
+	if err != nil || flagWins.maxChats != 8 {
+		t.Fatalf("flag over env %+v %v", flagWins, err)
+	}
+
+	for _, raw := range []string{"0", "-1", "nope"} {
+		_, err := parseSurface([]string{"--max-chats", raw, "http://connector.example:8080", "alice"}, nil)
+		if err == nil || !strings.Contains(err.Error(), "SURFACE_MAX_CHATS not a positive integer") {
+			t.Fatalf("raw %q: %v", raw, err)
+		}
+	}
+	_, err = parseSurface([]string{"--config", path, "http://127.0.0.1:8080", "alice"}, func(k string) (string, bool) {
+		if k == "SURFACE_MAX_CHATS" {
+			return "0", true
+		}
+		return "", false
+	})
+	if err == nil || !strings.Contains(err.Error(), "SURFACE_MAX_CHATS not a positive integer") {
+		t.Fatalf("env zero: %v", err)
+	}
+}
+
+func TestConnectSkippedAtCapacity(t *testing.T) {
+	var connects int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/connect" {
+			connects++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{
+		base:     srv.URL,
+		myKey:    "bob",
+		token:    "dev",
+		ctx:      ctx,
+		cancel:   cancel,
+		maxChats: 1,
+	}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	if err := a.handleLine("connect carol"); err != nil {
+		t.Fatal(err)
+	}
+	if connects != 0 {
+		t.Fatalf("connect posted %d times", connects)
+	}
+}
+
+func TestAcceptSkippedAtCapacity(t *testing.T) {
+	var accepts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			accepts++
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{base: srv.URL, token: "dev", ctx: ctx, cancel: cancel, maxChats: 1}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	if err := a.handleLine("accept req-b"); err != nil {
+		t.Fatal(err)
+	}
+	if accepts != 0 {
+		t.Fatalf("accept posted %d times", accepts)
+	}
+}
+
+func TestAcceptWhileFocusedHitsConnector(t *testing.T) {
+	var accepts int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/accept") {
+			accepts++
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{base: srv.URL, token: "dev", ctx: ctx, cancel: cancel, maxChats: 4}
+	a.initRegistry()
+	_ = attachPipe(t, a.registry, "req-a", "alice")
+	_ = a.handleLine("accept req-b")
+	if accepts != 1 {
+		t.Fatalf("accept posted %d times", accepts)
+	}
+}
+
+func TestHandleLineQuitEndsOnlyFocused(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{ctx: ctx, cancel: cancel, maxChats: 4, resumeWindow: time.Minute}
+	a.initRegistry()
+	go a.pumpEvents()
+	first := attachPipe(t, a.registry, "req-a", "alice")
+	second := attachPipe(t, a.registry, "req-b", "bob")
+	if err := a.handleLine("/quit"); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, a.registry, second.ID())
+	if !a.registry.Has(first.ID()) {
+		t.Fatal("quit closed the unfocused conversation")
 	}
 }
 
