@@ -355,11 +355,13 @@ func reduceMouse(s screen, m tea.MouseMsg) (screen, intent, tea.Cmd) {
 	if hit, ok := s.toastHit(m.X, m.Y, width); ok {
 		return s.dropToast(hit), intent{}, nil
 	}
+	if m.Y == body {
+		return s, intent{}, nil
+	}
 	switch {
 	case m.Y >= body+1:
 		s.focus = focusCompose
 		s.hint = ""
-	case m.Y == body:
 	case m.X <= leftW:
 		s.focus = focusPeers
 		s.hint = ""
