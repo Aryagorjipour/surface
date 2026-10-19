@@ -405,10 +405,8 @@ func (c *Conversation) retryDial() {
 	for {
 		c.stateMu.Lock()
 		until := time.Time{}
-		var lines []string
 		if gap, ok := c.carrier.(carrierResumeGap); ok {
 			until = gap.until
-			lines = append([]string(nil), gap.queue...)
 		}
 		sess := c.sess
 		addr := c.addr
@@ -426,6 +424,7 @@ func (c *Conversation) retryDial() {
 		}
 		time.Sleep(time.Second)
 		c.stateMu.Lock()
+		var lines []string
 		if gap, ok := c.carrier.(carrierResumeGap); ok {
 			until = gap.until
 			lines = append([]string(nil), gap.queue...)

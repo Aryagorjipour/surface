@@ -53,14 +53,6 @@ func (a *app) println(args ...any) {
 	fmt.Println(args...)
 }
 
-func (a *app) toast(level toastLevel, args ...any) {
-	if a != nil && a.deskCh != nil {
-		a.note(note{kind: noteToast, level: level, text: lineText(args...)})
-		return
-	}
-	fmt.Println(args...)
-}
-
 func (a *app) serveDesk(in io.Reader, out io.Writer) error {
 	s := newScreen(a)
 	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithMouseCellMotion()}
