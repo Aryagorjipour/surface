@@ -81,6 +81,7 @@ func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof []
 func (a *app) failAttempt(ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		a.say("traversal failed")
+		a.markPhase(phaseLobby)
 	}
 	return nil
 }

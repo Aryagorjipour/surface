@@ -48,6 +48,7 @@ help:
     @echo '    key is required. listen defaults to 127.0.0.1:9001.'
     @echo '    Uses the documented local-stack connector token.'
     @echo '    Does not build or execute a surface binary.'
+    @echo '    A terminal opens a keyboard UI. A pipe keeps the line commands.'
     @echo ''
     @echo 'When invocation, compose, health, readiness, local-stack credentials,'
     @echo 'punch, relay, or these recipes change, update this guide, the README'
