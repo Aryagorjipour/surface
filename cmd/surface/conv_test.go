@@ -319,7 +319,7 @@ func TestNetworkCloseStillResumes(t *testing.T) {
 	if !r.Has("req-net") || session.Finished(dialer) {
 		t.Fatal("network close finished the session")
 	}
-	if !r.ExpectingResume() {
+	if !r.expectingResume() {
 		t.Fatal("network close did not arm resume")
 	}
 }

@@ -180,7 +180,7 @@ func (r *Registry) IDForPeer(peer string) ConvID {
 	return ""
 }
 
-func (r *Registry) ExpectingResume() bool {
+func (r *Registry) expectingResume() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, c := range r.byID {
