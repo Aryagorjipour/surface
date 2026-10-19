@@ -4,6 +4,7 @@
 
 ### Added
 
+- One Surface can keep several direct chats at once. `--max-chats` / `SURFACE_MAX_CHATS` sets the ceiling (default 4). `/focus` and `/chats` switch among live conversations without closing inactive sockets.
 - `just help` starts the dev Connector, a dev Surface from source, and the stage or production Connector.
 
 ### Fixed
