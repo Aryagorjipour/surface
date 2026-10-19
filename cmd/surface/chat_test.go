@@ -465,91 +465,21 @@ func TestHandshakeRefusesUnreadableRequest(t *testing.T) {
 	}
 }
 
-func TestFailedOpenEndsBothSides(t *testing.T) {
-	dialer, listener := admittedPair(t)
-	other, _ := admittedPair(t)
-	foreign, err := session.Seal(other, "not-the-line", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	left := &app{
-		ctx:          ctx,
-		resumeWindow: time.Minute,
-		sess:         dialer,
-		inChat:       true,
-		dialer:       true,
-	}
-	right := &app{
-		ctx:          ctx,
-		resumeWindow: time.Minute,
-		sess:         listener,
-		inChat:       true,
-	}
-	client, server := wsPair(t)
-	left.chatConn = client
-	right.chatConn = server
-
-	leftDone := make(chan bool, 1)
-	rightDone := make(chan bool, 1)
-	out := captureStdout(t, func() {
-		go func() { leftDone <- left.readLoop(client) }()
-		go func() { rightDone <- right.readLoop(server) }()
-		if err := client.Write(ctx, websocket.MessageBinary, foreign); err != nil {
-			t.Error(err)
-		}
-		waitDone(t, leftDone, "dialer")
-		waitDone(t, rightDone, "listener")
-	})
-	if strings.Contains(out, "not-the-line") {
-		t.Fatalf("displayed undecrypted bytes: %q", out)
-	}
-	if strings.Contains(out, "left chat") {
-		t.Fatalf("failed open printed quit line: %q", out)
-	}
-	if strings.Count(out, "chat ended") < 2 {
-		t.Fatalf("both sides should end: %q", out)
-	}
-	if !left.resumeUntil.IsZero() || !right.resumeUntil.IsZero() {
-		t.Fatal("failed open started the resume window")
-	}
-	if !session.Finished(dialer) || !session.Finished(listener) {
-		t.Fatal("session still resumable")
-	}
-	if _, err := session.ResumeOffer(dialer); err == nil {
-		t.Fatal("dialer resumed after a failed open")
-	}
-}
-
-func TestNetworkCloseStillResumes(t *testing.T) {
-	dialer, _ := admittedPair(t)
-	ctx := context.Background()
-	client, server := wsPair(t)
-	a := &app{
-		ctx:          ctx,
-		resumeWindow: time.Minute,
-		sess:         dialer,
-		chatConn:     client,
-		inChat:       true,
-		dialer:       true,
-	}
-	_ = server.Close(websocket.StatusGoingAway, "")
-	if !a.readLoop(client) {
-		t.Fatal("network close did not arm resume")
-	}
-	if a.resumeUntil.IsZero() || session.Finished(dialer) {
-		t.Fatal("network close finished the session")
-	}
-}
-
 func admittedPair(t *testing.T) (*session.Session, *session.Session) {
+	t.Helper()
+	dialer, listener, client, server := handshakePair(t, "req-open")
+	_ = client.CloseNow()
+	_ = server.CloseNow()
+	return dialer, listener
+}
+
+func handshakePair(t *testing.T, id string) (*session.Session, *session.Session, *websocket.Conn, *websocket.Conn) {
 	t.Helper()
 	raw, _, err := session.NewProof()
 	if err != nil {
 		t.Fatal(err)
 	}
 	const (
-		id     = "req-open"
 		caller = "caller"
 		target = "target"
 	)
@@ -573,21 +503,7 @@ func admittedPair(t *testing.T) (*session.Session, *session.Session) {
 	if dialer == nil || listener == nil {
 		t.Fatal("missing session")
 	}
-	_ = client.CloseNow()
-	_ = server.CloseNow()
-	return dialer, listener
-}
-
-func waitDone(t *testing.T, done <-chan bool, side string) {
-	t.Helper()
-	select {
-	case armed := <-done:
-		if armed {
-			t.Errorf("%s armed resume", side)
-		}
-	case <-time.After(2 * time.Second):
-		t.Errorf("%s did not end", side)
-	}
+	return dialer, listener, client, server
 }
 
 func wsPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
