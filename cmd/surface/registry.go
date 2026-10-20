@@ -163,6 +163,21 @@ func (r *Registry) Len() int {
 	return len(r.byID)
 }
 
+// Owns is true while any conversation for peer exists, including a resume gap.
+func (r *Registry) Owns(peer string) bool {
+	if r == nil || peer == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.byID {
+		if c != nil && c.peer == peer {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Registry) IDForPeer(peer string) ConvID {
 	r.mu.Lock()
 	defer r.mu.Unlock()
