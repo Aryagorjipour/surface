@@ -147,6 +147,37 @@ func TestPruneDropsStalePeers(t *testing.T) {
 	}
 }
 
+func TestCountLivePeersOmitsStaleRows(t *testing.T) {
+	store := testStore(t)
+	ctx := context.Background()
+	t0 := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	now := t0
+	store.SetNow(func() time.Time { return now })
+	window := 10 * time.Second
+
+	n, err := store.CountLivePeers(ctx, now, window)
+	if err != nil || n != 0 {
+		t.Fatalf("empty %d %v", n, err)
+	}
+	if err := store.UpsertPeer(ctx, "live-peer", "198.51.100.10:4242", "available"); err != nil {
+		t.Fatal(err)
+	}
+	now = t0.Add(-30 * time.Second)
+	if err := store.UpsertPeer(ctx, "stale-peer", "198.51.100.11:4243", "available"); err != nil {
+		t.Fatal(err)
+	}
+	now = t0
+	n, err = store.CountLivePeers(ctx, now, window)
+	if err != nil || n != 1 {
+		t.Fatalf("live %d %v", n, err)
+	}
+	now = t0.Add(-30 * time.Second)
+	n, err = store.CountLivePeers(ctx, now, window)
+	if err != nil || n != 2 {
+		t.Fatalf("rewound %d %v", n, err)
+	}
+}
+
 func TestEncryptDecrypt(t *testing.T) {
 	key := make([]byte, 32)
 	ct, nonce, err := encrypt(key, "secret-address")
