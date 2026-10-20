@@ -50,6 +50,9 @@ func TestCensusReportsCountsWithoutIdentifiers(t *testing.T) {
 		t.Fatalf("stale register %d %s", rec.Code, rec.Body.String())
 	}
 	now = t0
+	if rec := postMux(mux, "/peers", peerJSON(fromKey, fromAddr, "available")); rec.Code != http.StatusOK {
+		t.Fatalf("caller register %d %s", rec.Code, rec.Body.String())
+	}
 	rec := postMux(mux, "/connect", connectJSON(fromKey, liveKey, fromAddr))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("connect %d %s", rec.Code, rec.Body.String())
@@ -61,7 +64,7 @@ func TestCensusReportsCountsWithoutIdentifiers(t *testing.T) {
 		t.Fatalf("request id %q %v", created.ID, err)
 	}
 
-	assertCount(t, callMux(mux, http.MethodGet, "/operator/peers", "", ""), 1, banned...)
+	assertCount(t, callMux(mux, http.MethodGet, "/operator/peers", "", ""), 2, banned...)
 	assertCount(t, callMux(mux, http.MethodGet, "/operator/pending", "", ""), 1, banned...)
 
 	now = t0.Add(h.requestLifetime() + time.Second)
@@ -76,7 +79,7 @@ func TestCensusReportsCountsWithoutIdentifiers(t *testing.T) {
 	assertCount(t, callMux(mux, http.MethodGet, "/operator/pending", "", ""), 0, banned...)
 
 	now = t0.Add(-30 * time.Second)
-	assertCount(t, callMux(mux, http.MethodGet, "/operator/peers", "", ""), 2, banned...)
+	assertCount(t, callMux(mux, http.MethodGet, "/operator/peers", "", ""), 3, banned...)
 
 	h.SetCensus(false)
 	requirePhrase(t, callMux(mux, http.MethodGet, "/operator/peers", "", ""), http.StatusNotFound, "not found")

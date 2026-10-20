@@ -145,10 +145,10 @@ func TestPathHarnesses(t *testing.T) {
 		dialer, listener := startPathPair(t, base, token, "block-alice", "block-bob", "", "", "", "")
 		rewritePeer(t, base, token, listener.app.myKey, "127.0.0.1:1")
 		go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
-		_, proof := acceptPath(t, base, token, listener)
+		acceptPath(t, base, token, listener)
 		assertPathFailed(t, dialer, listener)
-		if got := pathProof(t, base, token, listener.lastID); got != proof || pathStatus(t, base, token, listener.lastID) != "accepted" {
-			t.Fatalf("status %s proof %q want accepted %q", pathStatus(t, base, token, listener.lastID), got, proof)
+		if pathStatus(t, base, token, listener.lastID) != "accepted" || bytes.Contains(getPath(t, base, token, "/requests/"+listener.lastID), []byte("admission_proof")) {
+			t.Fatalf("status %s body %s", pathStatus(t, base, token, listener.lastID), getPath(t, base, token, "/requests/"+listener.lastID))
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -435,7 +435,7 @@ func startPathSurface(t *testing.T, base, token, key, punch, relay, bind string)
 		ctx:          ctx,
 		cancel:       cancel,
 		presence:     "available",
-		fromKey:      map[string]string{},
+		fromKey:      map[string]savedCaller{},
 		punchAddr:    punch,
 		relayAddr:    relay,
 		out:          buf,
@@ -467,14 +467,18 @@ func waitPathListen(t *testing.T, addr string) {
 	t.Fatalf("not listening on %s", addr)
 }
 
-func acceptPath(t *testing.T, base, token string, listener *pathApp) (string, string) {
+func acceptPath(t *testing.T, base, token string, listener *pathApp) string {
 	t.Helper()
 	id := waitPathPending(t, base, token, listener.app.myKey)
 	listener.lastID = id
 	if err := listener.app.handleLine("accept " + id); err != nil {
 		t.Fatal(err)
 	}
-	return id, pathProof(t, base, token, id)
+	body := getPath(t, base, token, "/requests/"+id)
+	if pathStatus(t, base, token, id) != "accepted" || bytes.Contains(body, []byte("admission_proof")) {
+		t.Fatalf("accepted body %s", body)
+	}
+	return id
 }
 
 func waitPathPending(t *testing.T, base, token, key string) string {
@@ -492,20 +496,6 @@ func waitPathPending(t *testing.T, base, token, key string) string {
 	}
 	t.Fatal("no pending request")
 	return ""
-}
-
-func pathProof(t *testing.T, base, token, id string) string {
-	t.Helper()
-	var body struct {
-		Proof string `json:"admission_proof"`
-	}
-	if err := json.Unmarshal(getPath(t, base, token, "/requests/"+id), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Proof == "" {
-		t.Fatal("missing proof")
-	}
-	return body.Proof
 }
 
 func pathStatus(t *testing.T, base, token, id string) string {
@@ -543,7 +533,15 @@ func getPath(t *testing.T, base, token, path string) []byte {
 
 func rewritePeer(t *testing.T, base, token, key, addr string) {
 	t.Helper()
-	raw, err := json.Marshal(map[string]string{"key": key, "address": addr, "state": "available"})
+	var current struct {
+		Identity string `json:"identity"`
+	}
+	if err := json.Unmarshal(getPath(t, base, token, "/peers/"+key), &current); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(map[string]string{
+		"key": key, "address": addr, "state": "available", "identity": current.Identity,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

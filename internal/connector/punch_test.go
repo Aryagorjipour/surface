@@ -64,7 +64,7 @@ func TestPunchObservation(t *testing.T) {
 	requirePhrase(t, early, http.StatusConflict, "request not accepted")
 
 	accepted := callMuxToken(mux, http.MethodPost, "/requests/"+cr.ID+"/accept", "", "192.0.2.46:46", token)
-	proof := requireAccepted(t, accepted)
+	requireAccepted(t, accepted)
 
 	rawA, hexA := mustPunchTicket(t)
 	rawB, hexB := mustPunchTicket(t)
@@ -149,8 +149,11 @@ func TestPunchObservation(t *testing.T) {
 	if err := json.Unmarshal(status.Body.Bytes(), &statusBody); err != nil {
 		t.Fatal(err)
 	}
-	if statusBody["status"] != "accepted" || statusBody["admission_proof"] != proof {
+	if statusBody["status"] != "accepted" {
 		t.Fatalf("status changed %#v", statusBody)
+	}
+	if _, ok := statusBody["admission_proof"]; ok {
+		t.Fatalf("status carried a proof %#v", statusBody)
 	}
 	for _, banned := range []string{"ticket", "punch", "peer"} {
 		if _, ok := statusBody[banned]; ok {

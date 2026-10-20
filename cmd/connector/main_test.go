@@ -305,7 +305,7 @@ func TestDropPrunedPeerCacheDeletesKeys(t *testing.T) {
 	if err := client.Ping(ctx).Err(); err != nil {
 		t.Fatal(err)
 	}
-	cache := connector.NewRedis(addr, "")
+	cache := connector.NewRedis(addr, "", bytes.Repeat([]byte{1}, 32))
 	t.Cleanup(func() {
 		if err := cache.Close(); err != nil {
 			t.Error(err)

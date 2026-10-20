@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
@@ -11,12 +12,16 @@ import (
 	"time"
 )
 
+func redisEncKey() []byte {
+	return bytes.Repeat([]byte{4}, 32)
+}
+
 func TestRedisExpiry(t *testing.T) {
 	addr := os.Getenv("SURFACE_TEST_REDIS")
 	if addr == "" {
 		t.Skip("SURFACE_TEST_REDIS unset")
 	}
-	cache := NewRedis(addr, "")
+	cache := NewRedis(addr, "", redisEncKey())
 	ctx := context.Background()
 	if err := cache.Ping(ctx); err != nil {
 		t.Fatal(err)
@@ -35,7 +40,8 @@ func TestRedisExpiry(t *testing.T) {
 
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	target := "redis-target-" + suffix
-	caller := "redis-caller-" + suffix
+	callerA := "redis-caller-a-" + suffix
+	callerB := "redis-caller-b-" + suffix
 	staleKey := "redis-stale-" + suffix
 	staleAddr := "198.51.100.8:8"
 	t.Cleanup(func() {
@@ -46,15 +52,19 @@ func TestRedisExpiry(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register target %d %s", rec.Code, rec.Body.String())
 	}
-	rec = postMux(mux, "/peers", peerJSON(caller, "203.0.113.21:21", "available"))
+	rec = postMux(mux, "/peers", peerJSON(callerA, "203.0.113.21:21", "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
 	}
+	rec = postMux(mux, "/peers", peerJSON(callerB, "203.0.113.22:22", "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register second caller %d %s", rec.Code, rec.Body.String())
+	}
 
-	idA := mustConnect(t, mux, caller, target, "203.0.113.21:21")
+	idA := mustConnect(t, mux, callerA, target, "203.0.113.21:21")
 	t.Cleanup(func() { _ = cache.client.Del(ctx, "req:"+idA).Err() })
 	h.SetLifetime(30 * time.Second)
-	idB := mustConnect(t, mux, caller, target, "203.0.113.21:21")
+	idB := mustConnect(t, mux, callerB, target, "203.0.113.22:22")
 	t.Cleanup(func() { _ = cache.client.Del(ctx, "req:"+idB).Err() })
 
 	time.Sleep(1200 * time.Millisecond)
@@ -115,7 +125,7 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	if addr == "" {
 		t.Skip("SURFACE_TEST_REDIS unset")
 	}
-	cache := NewRedis(addr, "")
+	cache := NewRedis(addr, "", redisEncKey())
 	ctx := context.Background()
 	if err := cache.Ping(ctx); err != nil {
 		t.Fatal(err)
@@ -165,6 +175,10 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Second)
+	rec = postMux(mux, "/peers", peerJSON("connect-caller", fromAddr, "available"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	rec = postMux(mux, "/connect", connectJSON("connect-caller", staleKey, fromAddr))
 	requirePhrase(t, rec, http.StatusNotFound, "target not found")
 	if strings.Contains(rec.Body.String(), staleAddr) || strings.Contains(rec.Body.String(), staleKey) {
@@ -213,7 +227,7 @@ func TestRedisRestart(t *testing.T) {
 	if addr == "" {
 		t.Skip("SURFACE_TEST_REDIS unset")
 	}
-	cache := NewRedis(addr, "")
+	cache := NewRedis(addr, "", redisEncKey())
 	ctx := context.Background()
 	if err := cache.Ping(ctx); err != nil {
 		t.Fatal(err)
@@ -262,8 +276,12 @@ func TestRedisRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "expires_at") {
-		t.Fatalf("stored body missing expires_at: %s", raw)
+	if strings.Contains(string(raw), "expires_at") || strings.Contains(string(raw), fromAddr) {
+		t.Fatal("sealed request exposed plaintext")
+	}
+	plain, err := openRequest(redisEncKey(), raw)
+	if err != nil || !strings.Contains(plain, "expires_at") || !strings.Contains(plain, fromAddr) {
+		t.Fatalf("opened body %q %v", plain, err)
 	}
 
 	h2 := newHandlers(&now)
@@ -367,6 +385,56 @@ func TestRedisRestart(t *testing.T) {
 	requirePhrase(t, rec, http.StatusNotFound, "request not found")
 	rec = getReq(mux4, "/pending?key="+targetA, "")
 	requirePhrase(t, rec, http.StatusOK, "[]")
+}
+
+func TestSealedRequestHidesAddress(t *testing.T) {
+	addr := os.Getenv("SURFACE_TEST_REDIS")
+	if addr == "" {
+		t.Skip("SURFACE_TEST_REDIS unset")
+	}
+	cache := NewRedis(addr, "", redisEncKey())
+	ctx := context.Background()
+	if err := cache.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := cache.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	store := testStore(t)
+	h := newTestHandlers(store, cache, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	caller := "sealed-caller-" + suffix
+	target := "sealed-target-" + suffix
+	const fromAddr = "203.0.113.44:4400"
+	t.Cleanup(func() {
+		_ = cache.client.Del(ctx, "pending:"+target).Err()
+	})
+	for _, key := range []string{caller, target} {
+		rec := postMux(mux, "/peers", peerJSON(key, "203.0.113.45:45", "available"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("register %s %d %s", key, rec.Code, rec.Body.String())
+		}
+	}
+	id := mustConnect(t, mux, caller, target, fromAddr)
+	t.Cleanup(func() { _ = cache.client.Del(ctx, "req:"+id).Err() })
+
+	raw, err := cache.client.Get(ctx, "req:"+id).Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "from_address") || strings.Contains(string(raw), fromAddr) {
+		t.Fatal("raw request contains the address")
+	}
+	plain, err := openRequest(redisEncKey(), raw)
+	if err != nil || !strings.Contains(plain, fromAddr) || !strings.Contains(plain, "expires_at") {
+		t.Fatalf("opened %q %v", plain, err)
+	}
 }
 
 func containsID(ids []string, id string) bool {

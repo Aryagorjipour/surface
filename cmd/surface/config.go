@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Aryagorjipour/surface/internal/shared"
 )
 
 var errHelp = errors.New("help")
@@ -23,6 +25,8 @@ type surfaceConfig struct {
 	punch     string
 	maxChats  int
 	mailbox   time.Duration
+	direct    shared.CertPair
+	directCA  string
 	rest      []string
 }
 
@@ -42,6 +46,12 @@ func surfaceHelp() string {
         punch address (default the connector host port 8081)
   --max-chats int
         max concurrent chats (default 4)
+  --direct-cert path
+        direct tls certificate (default unset)
+  --direct-key path
+        direct tls private key (default unset)
+  --direct-ca path
+        direct tls root (default the system pool)
   --config path
         config file (default unset)
   --help
@@ -58,6 +68,9 @@ var surfaceFileKeys = map[string]struct{}{
 	"SURFACE_PUNCH":              {},
 	"SURFACE_MAX_CHATS":          {},
 	"SURFACE_CONFIG":             {},
+	"SURFACE_DIRECT_CERT":        {},
+	"SURFACE_DIRECT_KEY":         {},
+	"SURFACE_DIRECT_CA":          {},
 }
 
 var surfaceSecretNames = map[string]struct{}{
@@ -73,6 +86,7 @@ var surfaceSecretNames = map[string]struct{}{
 	"connector_token":         {},
 	"VAULT_TOKEN":             {},
 	"SURFACE_CONNECTOR_TOKEN": {},
+	"SURFACE_IDENTITY_SEED":   {},
 }
 
 func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceConfig, error) {
@@ -89,6 +103,9 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	relayFlag := fs.String("relay", "", "relay address")
 	punchFlag := fs.String("punch", "", "punch address")
 	maxChatsFlag := fs.String("max-chats", "4", "max concurrent chats")
+	directCert := fs.String("direct-cert", "", "direct tls certificate")
+	directKey := fs.String("direct-key", "", "direct tls private key")
+	directCA := fs.String("direct-ca", "", "direct tls root")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
 		return surfaceConfig{}, err
@@ -172,6 +189,13 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	if err != nil {
 		return surfaceConfig{}, err
 	}
+	certPath, _ := pickSurface(set["direct-cert"], *directCert, lookup, file, "SURFACE_DIRECT_CERT")
+	keyPath, _ := pickSurface(set["direct-key"], *directKey, lookup, file, "SURFACE_DIRECT_KEY")
+	caPath, _ := pickSurface(set["direct-ca"], *directCA, lookup, file, "SURFACE_DIRECT_CA")
+	pair, err := shared.ResolveCertPair(certPath, keyPath)
+	if err != nil {
+		return surfaceConfig{}, err
+	}
 	return surfaceConfig{
 		heartbeat: hb,
 		resume:    window,
@@ -180,6 +204,8 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 		punch:     punch,
 		maxChats:  maxChats,
 		mailbox:   mailboxTTL,
+		direct:    pair,
+		directCA:  caPath,
 		rest:      fs.Args(),
 	}, nil
 }

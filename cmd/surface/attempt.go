@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,18 +42,36 @@ func happyDial(ctx context.Context, network, addr string) (net.Conn, error) {
 	return dialer.DialContext(ctx, network, addr)
 }
 
-func dialWebSocket(ctx context.Context, addr hostport.Addr) (*websocket.Conn, error) {
-	conn, _, err := websocket.Dial(ctx, "ws://"+addr.String(), &websocket.DialOptions{
-		HTTPClient: wsClient,
+func directURL(addr hostport.Addr, secure bool) string {
+	scheme := "ws"
+	if secure {
+		scheme = "wss"
+	}
+	return scheme + "://" + addr.String()
+}
+
+func dialPeer(ctx context.Context, addr hostport.Addr, secure bool, roots *x509.CertPool) (*websocket.Conn, error) {
+	client := wsClient
+	if secure {
+		tr := happyTransport()
+		tr.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+		client = &http.Client{Transport: tr}
+	}
+	conn, _, err := websocket.Dial(ctx, directURL(addr, secure), &websocket.DialOptions{
+		HTTPClient: client,
 	})
 	return conn, err
+}
+
+func dialWebSocket(ctx context.Context, addr hostport.Addr) (*websocket.Conn, error) {
+	return dialPeer(ctx, addr, false, nil)
 }
 
 func setAttemptBudget(d time.Duration) { attemptBudget = d }
 
 func setDialTimeout(d time.Duration) { dialTimeout = d }
 
-func (a *app) attempt(dialer bool, addr, id, caller, target string, proof []byte) error {
+func (a *app) attempt(dialer bool, addr, id, caller, target string, proof session.HandshakeKey) error {
 	budget := attemptBudget
 	if dialer && acceptPoll < budget {
 		budget -= acceptPoll
@@ -86,7 +106,7 @@ func (a *app) attempt(dialer bool, addr, id, caller, target string, proof []byte
 	}
 }
 
-func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof []byte, dialer bool) {
+func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof session.HandshakeKey, dialer bool) {
 	if strings.TrimSpace(a.punchAddr) != "" {
 		a.punchPath(ctx, id, caller, target, proof, dialer)
 	}
@@ -134,13 +154,13 @@ func (a *app) waitConnected(ctx context.Context, d time.Duration, id string) boo
 	}
 }
 
-func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, proof []byte) bool {
+func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, proof session.HandshakeKey) bool {
 	addr, err := hostport.Parse(raw)
 	if err != nil {
 		return false
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	c, err := dialWebSocket(dialCtx, addr)
+	c, err := dialPeer(dialCtx, addr, a.directSecure, a.directRoots)
 	cancel()
 	if err != nil {
 		return false
@@ -201,7 +221,7 @@ func (a *app) postTicket(ctx context.Context, id, ticket string) string {
 	return out.Peer
 }
 
-func (a *app) punchPath(ctx context.Context, id, caller, target string, proof []byte, dialer bool) {
+func (a *app) punchPath(ctx context.Context, id, caller, target string, proof session.HandshakeKey, dialer bool) {
 	if a.chatting(id) {
 		return
 	}
@@ -271,7 +291,7 @@ func (a *app) datagramCtx(ctx context.Context) (context.Context, context.CancelF
 	return context.WithTimeout(ctx, left/2)
 }
 
-func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAddr, id, caller, target string, proof []byte) bool {
+func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAddr, id, caller, target string, proof session.HandshakeKey) bool {
 	msg, st, err := session.Offer(id, caller, target, proof)
 	if err != nil {
 		return false
@@ -313,7 +333,7 @@ func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAdd
 	}
 }
 
-func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPAddr, id, caller, target string, proof []byte) bool {
+func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPAddr, id, caller, target string, proof session.HandshakeKey) bool {
 	link := &udpLink{conn: conn, peer: remote}
 	var cache offerCache
 	for {
@@ -346,7 +366,7 @@ func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPA
 	}
 }
 
-func (a *app) takeUDPOffer(cache *offerCache, msg []byte, id, caller, target string, proof []byte) (reply []byte, sess *session.Session, reused bool, refused bool) {
+func (a *app) takeUDPOffer(cache *offerCache, msg []byte, id, caller, target string, proof session.HandshakeKey) (reply []byte, sess *session.Session, reused bool, refused bool) {
 	var opened *session.Session
 	out, reused, refused := cache.decide(msg, func(in []byte) ([]byte, error) {
 		reply, next, err := a.acceptDirect(in, id, caller, target, proof)
@@ -356,7 +376,7 @@ func (a *app) takeUDPOffer(cache *offerCache, msg []byte, id, caller, target str
 	return out, opened, reused, refused
 }
 
-func (a *app) acceptDirect(msg []byte, id, caller, target string, proof []byte) ([]byte, *session.Session, error) {
+func (a *app) acceptDirect(msg []byte, id, caller, target string, proof session.HandshakeKey) ([]byte, *session.Session, error) {
 	a.gate.mu.Lock()
 	_, spent := a.gate.live[id]
 	a.gate.mu.Unlock()
@@ -377,7 +397,7 @@ func (a *app) acceptDirect(msg []byte, id, caller, target string, proof []byte) 
 	return reply, sess, nil
 }
 
-func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []byte, dialer bool) {
+func (a *app) relayPath(ctx context.Context, id, caller, target string, proof session.HandshakeKey, dialer bool) {
 	if a.chatting(id) {
 		return
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,10 +28,7 @@ func TestWebsocketAcceptSpan(t *testing.T) {
 		target = "target"
 		addr   = "203.0.113.10:9001"
 	)
-	raw, text, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw, text := testHandshake(t)
 	ctx := context.Background()
 
 	g := &Gate{}
@@ -78,10 +76,7 @@ func TestWebsocketAcceptSpan(t *testing.T) {
 	assertWebsocketSpan(t, rec.Ended()[0], "accepted")
 	assertSpanClean(t, rec.Ended()[0], raw, text, caller, addr)
 
-	bad, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	bad, _ := testHandshake(t)
 	g.remember("req-bad", caller, target, bad)
 	client, server = wsPair(t)
 	refusedOut := captureStdout(t, func() {
@@ -106,7 +101,8 @@ func TestWebsocketAcceptSpan(t *testing.T) {
 	assertSpanClean(t, rec.Ended()[1], raw, text, caller, addr)
 
 	client, server = wsPair(t)
-	missing, _, err := session.Offer("req-miss", caller, target, make([]byte, session.ProofBytes))
+	var zero session.HandshakeKey
+	missing, _, err := session.Offer("req-miss", caller, target, zero)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,13 +198,13 @@ func assertWebsocketSpan(t *testing.T, sp sdktrace.ReadOnlySpan, status string) 
 	}
 }
 
-func assertSpanClean(t *testing.T, sp sdktrace.ReadOnlySpan, proof []byte, proofText, key, addr string) {
+func assertSpanClean(t *testing.T, sp sdktrace.ReadOnlySpan, proof session.HandshakeKey, proofText, key, addr string) {
 	t.Helper()
 	text := sp.Name()
 	for _, attr := range sp.Attributes() {
 		text += " " + string(attr.Key) + "=" + attr.Value.String()
 	}
-	for _, secret := range []string{string(proof), proofText, key, addr, "surface-round-trip"} {
+	for _, secret := range []string{string(proof[:]), proofText, key, addr, "surface-round-trip"} {
 		if secret != "" && strings.Contains(text, secret) {
 			t.Fatalf("span included private text")
 		}
@@ -223,10 +219,7 @@ func TestAdmitPrintsConnectedLines(t *testing.T) {
 		t.Fatalf("listener prompt %q", connectedPrompt(false))
 	}
 
-	raw, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw, _ := testHandshake(t)
 	const (
 		id     = "req-1"
 		caller = "caller"
@@ -267,10 +260,7 @@ func TestAdmitPrintsConnectedLines(t *testing.T) {
 		t.Fatalf("admit printed %q", out)
 	}
 
-	bad, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	bad, _ := testHandshake(t)
 	client, server = wsPair(t)
 	called := false
 	errCh := make(chan error, 1)
@@ -279,7 +269,7 @@ func TestAdmitPrintsConnectedLines(t *testing.T) {
 			called = true
 		})
 	}()
-	_, err = g.dialAdmitted(ctx, client, id, caller, target, raw)
+	_, err := g.dialAdmitted(ctx, client, id, caller, target, raw)
 	if err == nil {
 		t.Fatal("wrong proof dialed")
 	}
@@ -309,10 +299,7 @@ func TestAdmitPrintsConnectedLines(t *testing.T) {
 }
 
 func TestChatResumeSkipsPrompt(t *testing.T) {
-	raw, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw, _ := testHandshake(t)
 	const (
 		id     = "req-9"
 		caller = "caller"
@@ -389,10 +376,7 @@ func TestChatResumeSkipsPrompt(t *testing.T) {
 }
 
 func TestHandshakeRefusesUnreadableRequest(t *testing.T) {
-	raw, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw, _ := testHandshake(t)
 	const (
 		id     = "req-stale"
 		caller = "caller"
@@ -474,10 +458,7 @@ func admittedPair(t *testing.T) (*session.Session, *session.Session) {
 
 func handshakePair(t *testing.T, id string) (*session.Session, *session.Session, *websocket.Conn, *websocket.Conn) {
 	t.Helper()
-	raw, _, err := session.NewProof()
-	if err != nil {
-		t.Fatal(err)
-	}
+	raw, _ := testHandshake(t)
 	const (
 		caller = "caller"
 		target = "target"
@@ -533,6 +514,15 @@ func wsPair(t *testing.T) (*websocket.Conn, *websocket.Conn) {
 	}
 	t.Cleanup(func() { _ = server.Close(websocket.StatusNormalClosure, "") })
 	return client, server
+}
+
+func testHandshake(t *testing.T) (session.HandshakeKey, string) {
+	t.Helper()
+	key, err := session.NewHandshakeKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, base64.StdEncoding.EncodeToString(key[:])
 }
 
 func captureStdout(t *testing.T, fn func()) string {

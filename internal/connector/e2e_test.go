@@ -3,6 +3,8 @@ package connector
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
@@ -49,7 +51,7 @@ func TestE2E(t *testing.T) {
 	closeCh := make(chan error, 1)
 	wsErr := make(chan error, 1)
 
-	var proofText string
+	var listenKey session.HandshakeKey
 	var requestID string
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +60,7 @@ func TestE2E(t *testing.T) {
 			sendErr(wsErr, err)
 			return
 		}
-		text, bad := readAdmitted(ctx, c, requestID, e2eCallerKey, e2eCalleeKey, proofText)
+		text, bad := readAdmitted(ctx, c, requestID, e2eCallerKey, e2eCalleeKey, listenKey)
 		if bad != nil {
 			sendErr(wsErr, bad)
 			_ = c.Close(websocket.StatusPolicyViolation, "")
@@ -109,18 +111,21 @@ func TestE2E(t *testing.T) {
 
 	step("start", nil)
 
+	callerPriv, callerPub := testIdentity(t)
+	calleePriv, calleePub := testIdentity(t)
+
 	var registered struct {
 		OK bool `json:"ok"`
 	}
 	step("register", postJSON(ctx, base+"/peers", map[string]string{
-		"key": e2eCalleeKey, "address": calleeAddr, "state": "available",
+		"key": e2eCalleeKey, "address": calleeAddr, "state": "available", "identity": calleePub,
 	}, http.StatusOK, &registered))
 	if !registered.OK {
 		failE2E(t, "register", errors.New("not registered"), redact...)
 	}
 	registered.OK = false
 	step("register", postJSON(ctx, base+"/peers", map[string]string{
-		"key": e2eCallerKey, "address": e2eCallerAddr, "state": "available",
+		"key": e2eCallerKey, "address": e2eCallerAddr, "state": "available", "identity": callerPub,
 	}, http.StatusOK, &registered))
 	if !registered.OK {
 		failE2E(t, "register", errors.New("not registered"), redact...)
@@ -161,28 +166,40 @@ func TestE2E(t *testing.T) {
 	if !found {
 		failE2E(t, "accept", errors.New("missing request"), redact...)
 	}
+	var acceptRaw json.RawMessage
+	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptRaw))
+	if bytes.Contains(acceptRaw, []byte("admission_proof")) {
+		failE2E(t, "accept", errors.New("status"), redact...)
+	}
 	var acceptBody struct {
 		Status string `json:"status"`
-		Proof  string `json:"admission_proof"`
 	}
-	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptBody))
-	if acceptBody.Status != "accepted" || acceptBody.Proof == "" {
+	if err := json.Unmarshal(acceptRaw, &acceptBody); err != nil || acceptBody.Status != "accepted" {
 		failE2E(t, "accept", errors.New("status"), redact...)
 	}
-	proofText = acceptBody.Proof
 	requestID = created.ID
-	var accepted struct {
-		Status string `json:"status"`
-		Proof  string `json:"admission_proof"`
-	}
-	step("accept", getJSON(ctx, base+"/requests/"+created.ID, http.StatusOK, &accepted))
-	if accepted.Status != "accepted" || accepted.Proof != proofText {
+	var acceptedRaw json.RawMessage
+	step("accept", getJSON(ctx, base+"/requests/"+created.ID, http.StatusOK, &acceptedRaw))
+	if bytes.Contains(acceptedRaw, []byte("admission_proof")) {
 		failE2E(t, "accept", errors.New("status"), redact...)
+	}
+	var accepted struct {
+		Status       string `json:"status"`
+		FromIdentity string `json:"from_identity"`
+		ToIdentity   string `json:"to_identity"`
+	}
+	if err := json.Unmarshal(acceptedRaw, &accepted); err != nil || accepted.Status != "accepted" || accepted.FromIdentity != callerPub || accepted.ToIdentity != calleePub {
+		failE2E(t, "accept", errors.New("status"), redact...)
+	}
+	dialKey := admitKey(t, callerPriv, accepted.ToIdentity, requestID)
+	listenKey = admitKey(t, calleePriv, accepted.FromIdentity, requestID)
+	if dialKey != listenKey {
+		failE2E(t, "accept", errors.New("handshake"), redact...)
 	}
 
 	conn, _, err := websocket.Dial(ctx, "ws://"+looked.Address, nil)
 	step("exchange", err)
-	step("exchange", writeSealed(ctx, conn, requestID, e2eCallerKey, e2eCalleeKey, proofText, e2ePayload))
+	step("exchange", writeSealed(ctx, conn, requestID, e2eCallerKey, e2eCalleeKey, dialKey, e2ePayload))
 
 	var got []byte
 	select {
@@ -233,7 +250,7 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 
 	payloadCh := make(chan []byte, 1)
 	wsErr := make(chan error, 1)
-	var proofText string
+	var listenKey session.HandshakeKey
 	var requestID string
 	wsMux := http.NewServeMux()
 	wsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +259,7 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 			sendErr(wsErr, err)
 			return
 		}
-		text, bad := readAdmitted(ctx, c, requestID, "e2e-caller-open", "e2e-callee-open", proofText)
+		text, bad := readAdmitted(ctx, c, requestID, "e2e-caller-open", "e2e-callee-open", listenKey)
 		if bad != nil {
 			sendErr(wsErr, bad)
 			_ = c.Close(websocket.StatusPolicyViolation, "")
@@ -283,11 +300,13 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 	var registered struct {
 		OK bool `json:"ok"`
 	}
+	callerPriv, callerPub := testIdentity(t)
+	calleePriv, calleePub := testIdentity(t)
 	step("register", postJSON(ctx, base+"/peers", map[string]string{
-		"key": "e2e-callee-open", "address": calleeAddr, "state": "available",
+		"key": "e2e-callee-open", "address": calleeAddr, "state": "available", "identity": calleePub,
 	}, http.StatusOK, &registered))
 	step("register", postJSON(ctx, base+"/peers", map[string]string{
-		"key": "e2e-caller-open", "address": e2eCallerAddr, "state": "available",
+		"key": "e2e-caller-open", "address": e2eCallerAddr, "state": "available", "identity": callerPub,
 	}, http.StatusOK, &registered))
 
 	var looked struct {
@@ -304,21 +323,33 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 	step("connect", postJSON(ctx, base+"/connect", map[string]string{
 		"from_key": "e2e-caller-open", "to_key": "e2e-callee-open", "from_address": e2eCallerAddr,
 	}, http.StatusCreated, &created))
-	var acceptBody struct {
-		Status string `json:"status"`
-		Proof  string `json:"admission_proof"`
-	}
-	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptBody))
-	if acceptBody.Status != "accepted" || acceptBody.Proof == "" {
+	var acceptRaw json.RawMessage
+	step("accept", postJSON(ctx, base+"/requests/"+created.ID+"/accept", nil, http.StatusOK, &acceptRaw))
+	if bytes.Contains(acceptRaw, []byte("admission_proof")) {
 		failE2E(t, "accept", errors.New("status"))
 	}
-	proofText = acceptBody.Proof
+	var acceptBody struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(acceptRaw, &acceptBody); err != nil || acceptBody.Status != "accepted" {
+		failE2E(t, "accept", errors.New("status"))
+	}
 	requestID = created.ID
+	var accepted struct {
+		FromIdentity string `json:"from_identity"`
+		ToIdentity   string `json:"to_identity"`
+	}
+	step("accept", getJSON(ctx, base+"/requests/"+created.ID, http.StatusOK, &accepted))
+	dialKey := admitKey(t, callerPriv, accepted.ToIdentity, requestID)
+	listenKey = admitKey(t, calleePriv, accepted.FromIdentity, requestID)
+	if dialKey != listenKey || accepted.FromIdentity != callerPub || accepted.ToIdentity != calleePub {
+		failE2E(t, "accept", errors.New("handshake"))
+	}
 
 	conn, _, err := websocket.Dial(ctx, "ws://"+looked.Address, nil)
 	step("exchange", err)
 	h.SetNow(func() time.Time { return time.Now().Add(25 * time.Hour) })
-	step("exchange", writeSealed(ctx, conn, requestID, "e2e-caller-open", "e2e-callee-open", proofText, payload))
+	step("exchange", writeSealed(ctx, conn, requestID, "e2e-caller-open", "e2e-callee-open", dialKey, payload))
 
 	var got []byte
 	select {
@@ -337,7 +368,7 @@ func TestOpenChatSurvivesExpiry(t *testing.T) {
 	}
 }
 
-func readAdmitted(ctx context.Context, c *websocket.Conn, requestID, callerKey, targetKey, proofText string) (string, error) {
+func readAdmitted(ctx context.Context, c *websocket.Conn, requestID, callerKey, targetKey string, key session.HandshakeKey) (string, error) {
 	typ, data, err := c.Read(ctx)
 	if err != nil {
 		return "", err
@@ -345,11 +376,7 @@ func readAdmitted(ctx context.Context, c *websocket.Conn, requestID, callerKey, 
 	if typ != websocket.MessageBinary {
 		return "", errors.New("frame type")
 	}
-	raw, err := session.DecodeProof(proofText)
-	if err != nil {
-		return "", err
-	}
-	reply, sess, err := session.AcceptOffer(data, requestID, callerKey, targetKey, raw, false)
+	reply, sess, err := session.AcceptOffer(data, requestID, callerKey, targetKey, key, false)
 	if err != nil {
 		return "", err
 	}
@@ -385,12 +412,8 @@ func readAdmitted(ctx context.Context, c *websocket.Conn, requestID, callerKey, 
 	return text, nil
 }
 
-func writeSealed(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey, proofText, plaintext string) error {
-	raw, err := session.DecodeProof(proofText)
-	if err != nil {
-		return err
-	}
-	offer, st, err := session.Offer(requestID, callerKey, targetKey, raw)
+func writeSealed(ctx context.Context, conn *websocket.Conn, requestID, callerKey, targetKey string, key session.HandshakeKey, plaintext string) error {
+	offer, st, err := session.Offer(requestID, callerKey, targetKey, key)
 	if err != nil {
 		return err
 	}
@@ -415,7 +438,7 @@ func writeSealed(ctx context.Context, conn *websocket.Conn, requestID, callerKey
 	if err := conn.Write(ctx, websocket.MessageBinary, frame); err != nil {
 		return err
 	}
-	otherRaw, _, err := session.NewProof()
+	otherRaw, err := session.NewHandshakeKey()
 	if err != nil {
 		return err
 	}
@@ -486,6 +509,28 @@ func doJSON(ctx context.Context, method, url string, in any, want int, out any) 
 		}
 	}
 	return nil
+}
+
+func testIdentity(t *testing.T) (*ecdh.PrivateKey, string) {
+	t.Helper()
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return priv, session.PublicText(priv.PublicKey())
+}
+
+func admitKey(t *testing.T, mine *ecdh.PrivateKey, peerText, requestID string) session.HandshakeKey {
+	t.Helper()
+	pub, err := session.ParsePublic(peerText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := session.DeriveHandshakeKey(mine, pub, requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func failE2E(t *testing.T, step string, err error, redact ...string) {

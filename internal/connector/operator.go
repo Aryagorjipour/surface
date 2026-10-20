@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Aryagorjipour/surface/internal/shared"
 )
 
 // ErrHelp means the process should print help and exit success.
@@ -31,9 +33,9 @@ type Operator struct {
 	Mailbox         time.Duration
 	Census          bool
 	Ready           bool
+	TLS             shared.CertPair
 }
 
-// ConnectorHelp is the text connector --help prints. It lists every flag and default.
 func ConnectorHelp() string {
 	return `usage: connector [flags]
   --listen address
@@ -68,6 +70,10 @@ func ConnectorHelp() string {
         mailbox TTL (default unset)
   --census
         operator peer and pending counts (default off)
+  --tls-cert path
+        tls certificate (default unset)
+  --tls-key path
+        tls private key (default unset)
   --ready
         probe http://127.0.0.1:8080/health and exit
   --config path
@@ -95,6 +101,8 @@ var connectorFileKeys = map[string]struct{}{
 	"SURFACE_MAILBOX":              {},
 	"SURFACE_CENSUS":               {},
 	"SURFACE_CONFIG":               {},
+	"SURFACE_TLS_CERT":             {},
+	"SURFACE_TLS_KEY":              {},
 }
 
 var secretFileNames = map[string]struct{}{
@@ -110,6 +118,7 @@ var secretFileNames = map[string]struct{}{
 	"connector_token":         {},
 	"VAULT_TOKEN":             {},
 	"SURFACE_CONNECTOR_TOKEN": {},
+	"SURFACE_IDENTITY_SEED":   {},
 }
 
 // ParseOperator applies defaults, then the file, then the environment, then set flags.
@@ -137,6 +146,8 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	punch := fs.String("punch", "127.0.0.1:8081", "punch listen address")
 	mailboxFlag := fs.String("mailbox", "", "mailbox TTL")
 	censusFlag := fs.Bool("census", false, "operator census")
+	tlsCert := fs.String("tls-cert", "", "tls certificate")
+	tlsKey := fs.String("tls-key", "", "tls private key")
 	ready := fs.Bool("ready", false, "probe health")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
@@ -147,9 +158,6 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	}
 	if *help {
 		return Operator{}, ErrHelp
-	}
-	if *ready {
-		return Operator{Ready: true}, nil
 	}
 
 	set := map[string]bool{}
@@ -214,6 +222,12 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	if err != nil {
 		return Operator{}, err
 	}
+	certPath, _ := pick(set["tls-cert"], *tlsCert, lookup, file, "SURFACE_TLS_CERT", "", true)
+	keyPath, _ := pick(set["tls-key"], *tlsKey, lookup, file, "SURFACE_TLS_KEY", "", true)
+	pair, err := shared.ResolveCertPair(certPath, keyPath)
+	if err != nil {
+		return Operator{}, err
+	}
 
 	return Operator{
 		Listen:          listenAddr,
@@ -231,6 +245,8 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 		PunchSet:        punchSet,
 		Mailbox:         mailboxTTL,
 		Census:          census,
+		Ready:           *ready,
+		TLS:             pair,
 	}, nil
 }
 

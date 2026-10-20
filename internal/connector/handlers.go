@@ -13,21 +13,51 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 )
 
 type ConnectRequest struct {
-	ID             string    `json:"request_id"`
-	FromKey        string    `json:"from_key"`
-	FromAddress    string    `json:"from_address"`
-	ToKey          string    `json:"to_key"`
-	Status         string    `json:"status"`
-	Created        time.Time `json:"created"`
-	AdmissionProof string    `json:"admission_proof,omitempty"`
-	expiresAt      time.Time `json:"-"`
+	ID           string    `json:"request_id"`
+	FromKey      string    `json:"from_key"`
+	FromAddress  string    `json:"from_address"`
+	FromIdentity string    `json:"from_identity"`
+	ToKey        string    `json:"to_key"`
+	ToIdentity   string    `json:"to_identity"`
+	Status       string    `json:"status"`
+	Created      time.Time `json:"created"`
+	expiresAt    time.Time `json:"-"`
+}
+
+type connectBody struct {
+	FromKey     string `json:"from_key"`
+	ToKey       string `json:"to_key"`
+	FromAddress string `json:"from_address"`
+}
+
+type createdBody struct {
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"`
+}
+
+type requestView struct {
+	RequestID    string    `json:"request_id"`
+	FromKey      string    `json:"from_key"`
+	FromAddress  string    `json:"from_address"`
+	FromIdentity string    `json:"from_identity"`
+	ToKey        string    `json:"to_key"`
+	ToIdentity   string    `json:"to_identity"`
+	Status       string    `json:"status"`
+	Created      time.Time `json:"created"`
+}
+
+type statusBody struct {
+	Status string `json:"status"`
+}
+
+type requestLog interface {
+	SetRequest(ctx context.Context, cr *ConnectRequest, ttl time.Duration) error
 }
 
 type Handlers struct {
@@ -37,6 +67,7 @@ type Handlers struct {
 	byID       map[string]*ConnectRequest
 	byToKey    map[string][]string
 	cache      *RedisCache
+	requests   requestLog
 	limits     *Limits
 	limitsOnce sync.Once
 	now        func() time.Time
@@ -49,16 +80,19 @@ type Handlers struct {
 }
 
 func NewHandlers(store *Store, cache *RedisCache, logger *slog.Logger) *Handlers {
-	return &Handlers{
+	h := &Handlers{
 		store:   store,
 		cache:   cache,
 		logger:  logger,
 		byID:    make(map[string]*ConnectRequest),
 		byToKey: make(map[string][]string),
 	}
+	if cache != nil {
+		h.requests = cache
+	}
+	return h
 }
 
-// SetLimits installs process limits before the first request.
 func (h *Handlers) SetLimits(l *Limits) {
 	h.limits = l
 }
@@ -264,15 +298,17 @@ func (h *Handlers) writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 type peerRequest struct {
-	Key     string `json:"key"`
-	Address string `json:"address"`
-	State   string `json:"state"`
+	Key      string `json:"key"`
+	Address  string `json:"address"`
+	State    string `json:"state"`
+	Identity string `json:"identity"`
 }
 
 type peerResponse struct {
-	Key     string `json:"key"`
-	Address string `json:"address"`
-	State   string `json:"state"`
+	Key      string `json:"key"`
+	Address  string `json:"address"`
+	State    string `json:"state"`
+	Identity string `json:"identity"`
 }
 
 func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
@@ -294,7 +330,7 @@ func (h *Handlers) handleUpsertPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.UpsertPeer(r.Context(), req.Key, req.Address, req.State); err != nil {
+	if err := h.store.UpsertPeer(r.Context(), req.Key, req.Address, req.State, req.Identity); err != nil {
 		h.logger.Error("upsert failed", "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -324,13 +360,13 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 			if p.LastSeen == 0 || PeerStale(p.LastSeen, h.clock(), h.silenceWindow()) {
 				_ = h.cache.DelPeer(r.Context(), key)
 			} else {
-				h.writeJSON(w, 0, peerResponse{Key: p.Key, Address: p.Address, State: p.State})
+				h.writeJSON(w, 0, peerResponse{Key: p.Key, Address: p.Address, State: p.State, Identity: p.Identity})
 				return
 			}
 		}
 	}
 
-	addr, state, seen, err := h.store.GetPeer(r.Context(), key)
+	addr, state, identity, seen, err := h.store.GetPeer(r.Context(), key)
 	if err != nil {
 		if err.Error() == "peer not found" {
 			http.Error(w, "not found", http.StatusNotFound)
@@ -341,9 +377,9 @@ func (h *Handlers) handleGetPeer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state}, seen.Unix(), h.silenceWindow())
+	_ = h.cache.SetPeer(r.Context(), key, peerResponse{Key: key, Address: addr, State: state, Identity: identity}, seen.Unix(), h.silenceWindow())
 
-	h.writeJSON(w, 0, peerResponse{Key: key, Address: addr, State: state})
+	h.writeJSON(w, 0, peerResponse{Key: key, Address: addr, State: state, Identity: identity})
 }
 
 func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -351,7 +387,7 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req ConnectRequest
+	var req connectBody
 	if err := json.Unmarshal(body, &req); err != nil {
 		h.reject(w, http.StatusBadRequest, "connect", "invalid json")
 		return
@@ -365,42 +401,116 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, state, _, err := h.store.GetPeer(r.Context(), req.ToKey)
+	h.mu.Lock()
+	if id := h.pendingIDLocked(req.FromKey, req.ToKey); id != "" {
+		h.mu.Unlock()
+		h.writeJSON(w, http.StatusOK, createdBody{RequestID: id, Status: "pending"})
+		return
+	}
+	h.mu.Unlock()
+
+	_, _, fromIdentity, _, err := h.store.GetPeer(r.Context(), req.FromKey)
+	if err != nil {
+		if err.Error() == "peer not found" {
+			_ = h.cache.DelPeer(r.Context(), req.FromKey)
+			http.Error(w, "caller not found", http.StatusNotFound)
+			return
+		}
+		if h.logger != nil {
+			h.logger.Error("get caller failed", "err", err)
+		}
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	_, state, toIdentity, _, err := h.store.GetPeer(r.Context(), req.ToKey)
 	if err != nil {
 		if err.Error() == "peer not found" {
 			_ = h.cache.DelPeer(r.Context(), req.ToKey)
+			http.Error(w, "target not found", http.StatusNotFound)
+			return
 		}
-		http.Error(w, "target not found", http.StatusNotFound)
+		if h.logger != nil {
+			h.logger.Error("get target failed", "err", err)
+		}
+		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
 	if state != "available" {
 		http.Error(w, "target not connectable", http.StatusConflict)
 		return
 	}
+	if fromIdentity == "" || toIdentity == "" {
+		http.Error(w, "identity required", http.StatusConflict)
+		return
+	}
 
 	created := h.clock()
 	lifetime := h.requestLifetime()
 	cr := &ConnectRequest{
-		ID:          uuid.NewString(),
-		FromKey:     req.FromKey,
-		FromAddress: req.FromAddress,
-		ToKey:       req.ToKey,
-		Status:      "pending",
-		Created:     created,
-		expiresAt:   RequestDeadline(created, time.Time{}, false, lifetime),
+		ID:           uuid.NewString(),
+		FromKey:      req.FromKey,
+		FromAddress:  req.FromAddress,
+		FromIdentity: fromIdentity,
+		ToKey:        req.ToKey,
+		ToIdentity:   toIdentity,
+		Status:       "pending",
+		Created:      created,
+		expiresAt:    RequestDeadline(created, time.Time{}, false, lifetime),
 	}
 
-	_ = h.cache.SetRequest(r.Context(), cr, lifetime)
-
 	h.mu.Lock()
-	h.byID[cr.ID] = cr
-	h.byToKey[req.ToKey] = append(h.byToKey[req.ToKey], cr.ID)
+	if id := h.pendingIDLocked(req.FromKey, req.ToKey); id != "" {
+		h.mu.Unlock()
+		h.writeJSON(w, http.StatusOK, createdBody{RequestID: id, Status: "pending"})
+		return
+	}
+	if err := h.putRequest(r.Context(), cr, lifetime); err != nil {
+		h.mu.Unlock()
+		if h.logger != nil {
+			h.logger.Error("store request", "err", err)
+		}
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	h.insertLocked(cr)
 	h.mu.Unlock()
 
-	h.writeJSON(w, http.StatusCreated, map[string]string{
-		"request_id": cr.ID,
-		"status":     cr.Status,
-	})
+	h.writeJSON(w, http.StatusCreated, createdBody{RequestID: cr.ID, Status: cr.Status})
+}
+
+func (h *Handlers) putRequest(ctx context.Context, cr *ConnectRequest, ttl time.Duration) error {
+	if h.requests == nil {
+		return nil
+	}
+	return h.requests.SetRequest(ctx, cr, ttl)
+}
+
+func (h *Handlers) pendingIDLocked(from, to string) string {
+	now := h.clock()
+	var best *ConnectRequest
+	for _, cr := range h.byID {
+		if cr == nil || cr.FromKey != from || cr.ToKey != to || cr.Status != "pending" {
+			continue
+		}
+		if !RequestReadable(now, cr.expiresAt) {
+			continue
+		}
+		if best == nil || cr.Created.Before(best.Created) {
+			best = cr
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.ID
+}
+
+func (h *Handlers) insertLocked(cr *ConnectRequest) {
+	if h.byID == nil {
+		h.byID = make(map[string]*ConnectRequest)
+	}
+	h.byID[cr.ID] = cr
+	h.byToKey[cr.ToKey] = append(h.byToKey[cr.ToKey], cr.ID)
 }
 
 type countResponse struct {
@@ -466,7 +576,7 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 	now := h.clock()
 	h.mu.Lock()
 	ids := append([]string(nil), h.byToKey[key]...)
-	out := make([]ConnectRequest, 0)
+	out := make([]requestView, 0)
 	var dropped []droppedRequest
 	for _, id := range ids {
 		cr := h.byID[id]
@@ -480,7 +590,7 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if cr.Status == "pending" {
-			out = append(out, *cr)
+			out = append(out, requestViewOf(cr))
 		}
 	}
 	h.mu.Unlock()
@@ -490,54 +600,17 @@ func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) handleAccept(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if fault, ok := ValidateID(h.lim().cfg, id); !ok {
-		h.reject(w, fault.Status, "accept", fault.Phrase)
-		return
-	}
-
-	h.mu.Lock()
-	cr, ok := h.byID[id]
-	if !ok || !RequestReadable(h.clock(), cr.expiresAt) {
-		item, removed := droppedRequest{}, false
-		if ok {
-			item, removed = h.removeLocked(id)
-		}
-		h.mu.Unlock()
-		if removed {
-			h.forgetRequests(r.Context(), []droppedRequest{item})
-		}
-		http.Error(w, "request not found", http.StatusNotFound)
-		return
-	}
-	now := h.clock()
-	life := h.requestLifetime()
-	if cr.Status == "pending" && cr.AdmissionProof == "" {
-		_, text, err := session.NewProof()
-		if err != nil {
-			h.mu.Unlock()
-			http.Error(w, "store error", http.StatusInternalServerError)
-			return
-		}
-		cr.AdmissionProof = text
-	}
-	cr.Status = "accepted"
-	cr.expiresAt = RequestDeadline(cr.Created, now, true, life)
-	stored := *cr
-	h.mu.Unlock()
-
-	_ = h.cache.SetRequest(r.Context(), &stored, life)
-
-	h.writeJSON(w, 0, struct {
-		Status         string `json:"status"`
-		AdmissionProof string `json:"admission_proof,omitempty"`
-	}{Status: "accepted", AdmissionProof: stored.AdmissionProof})
+	h.commitDecision(w, r, "accept")
 }
 
 func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
+	h.commitDecision(w, r, "reject")
+}
+
+func (h *Handlers) commitDecision(w http.ResponseWriter, r *http.Request, action string) {
 	id := r.PathValue("id")
 	if fault, ok := ValidateID(h.lim().cfg, id); !ok {
-		h.reject(w, fault.Status, "reject", fault.Phrase)
+		h.reject(w, fault.Status, action, fault.Phrase)
 		return
 	}
 
@@ -555,17 +628,33 @@ func (h *Handlers) handleReject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
+	next, code, write := StepFrom(cr.Status, action)
+	if !write {
+		body := statusBody{Status: cr.Status}
+		h.mu.Unlock()
+		h.writeJSON(w, code, body)
+		return
+	}
 	now := h.clock()
 	life := h.requestLifetime()
-	cr.Status = "rejected"
-	cr.expiresAt = RequestDeadline(cr.Created, now, true, life)
-	stored := *cr
+	updated := *cr
+	updated.Status = next
+	updated.expiresAt = RequestDeadline(cr.Created, now, true, life)
+	if err := h.putRequest(r.Context(), &updated, life); err != nil {
+		h.mu.Unlock()
+		if h.logger != nil {
+			h.logger.Error("store request", "err", err)
+		}
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	cr.Status = updated.Status
+	cr.expiresAt = updated.expiresAt
 	h.mu.Unlock()
-
-	_ = h.cache.SetRequest(r.Context(), &stored, life)
-
-	h.logger.Info("request rejected", "id", id)
-	h.writeJSON(w, 0, map[string]string{"status": "rejected"})
+	if action == "reject" && h.logger != nil {
+		h.logger.Info("request rejected")
+	}
+	h.writeJSON(w, code, statusBody{Status: next})
 }
 
 func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
@@ -589,10 +678,23 @@ func (h *Handlers) handleRequestStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request not found", http.StatusNotFound)
 		return
 	}
-	copy := *cr
+	view := requestViewOf(cr)
 	h.mu.Unlock()
 
-	h.writeJSON(w, 0, &copy)
+	h.writeJSON(w, 0, view)
+}
+
+func requestViewOf(cr *ConnectRequest) requestView {
+	return requestView{
+		RequestID:    cr.ID,
+		FromKey:      cr.FromKey,
+		FromAddress:  cr.FromAddress,
+		FromIdentity: cr.FromIdentity,
+		ToKey:        cr.ToKey,
+		ToIdentity:   cr.ToIdentity,
+		Status:       cr.Status,
+		Created:      cr.Created,
+	}
 }
 
 type droppedRequest struct {

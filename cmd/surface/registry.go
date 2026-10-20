@@ -79,6 +79,8 @@ func (r *Registry) Attach(req AttachReq) (*Conversation, error) {
 		carrier: carrierLive{conn: req.Conn},
 		dialer:  req.Dialer,
 		addr:    req.Addr,
+		secure:  req.Secure,
+		roots:   req.Roots,
 		window:  r.window,
 		gen:     1,
 		reg:     r,
