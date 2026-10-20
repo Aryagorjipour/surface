@@ -123,6 +123,12 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 
 	mux := http.NewServeMux()
 	h.Register(mux)
+	boxCtx, boxCancel := context.WithCancel(context.Background())
+	waitBox, err := h.MountMailbox(boxCtx, mux, op.Mailbox, op.Maintenance)
+	if err != nil {
+		logger.Error("mailbox", "err", err)
+		os.Exit(1)
+	}
 	if strings.TrimSpace(op.Punch) != "" {
 		go func() {
 			if err := listenPunch(ctx, op.Punch, h); err != nil && ctx.Err() == nil {
@@ -153,6 +159,10 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 
 	pruneCancel()
 	waitPrune()
+	boxCancel()
+	if waitBox != nil {
+		waitBox()
+	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
