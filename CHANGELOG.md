@@ -4,6 +4,7 @@
 
 ### Added
 
+- With `SURFACE_MAILBOX` set to a positive duration, Surface can leave one short encrypted line for a peer who is not in a chat. The connector stores the ciphertext until that peer collects it, or until the duration ends.
 - One Surface can keep several direct chats at once. `--max-chats` / `SURFACE_MAX_CHATS` sets the ceiling (default 4). `/focus` and `/chats` switch among live conversations without closing inactive sockets.
 - Surface desk shows system and connection events as timed toasts instead of transcript lines.
 - Surface desk supports mouse wheel scroll and click to focus panes, select peers, and dismiss toasts.

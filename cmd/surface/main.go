@@ -10,12 +10,14 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"log/slog"
 
+	"github.com/Aryagorjipour/surface/internal/mailbox"
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/Aryagorjipour/surface/internal/shared"
 	tea "github.com/charmbracelet/bubbletea"
@@ -56,6 +58,7 @@ type app struct {
 	relayAddr string
 	out       io.Writer
 	deskCh    chan tea.Msg
+	box       *mailbox.Box
 }
 
 func main() {
@@ -122,6 +125,9 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		maxChats:     cfg.maxChats,
 	}
 	a.initRegistry()
+	if err := a.openBox(cfg.mailbox); err != nil {
+		return err
+	}
 	a.gate.readable = a.requestReadable
 	go a.pumpEvents()
 	go a.serveWS()
@@ -132,6 +138,7 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	if stdinTerminal(stdin) {
 		a.deskCh = make(chan tea.Msg, 256)
 	}
+	a.collect()
 	go a.pollPending()
 	go a.heartbeatLoop()
 	if a.deskCh != nil {
@@ -159,6 +166,12 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 
 func (a *app) handleLine(line string) error {
 	a.initRegistry()
+	if a.box != nil {
+		handled, err := a.dispatchMailbox(line)
+		if err != nil || handled {
+			return err
+		}
+	}
 	if cmd, ok := parseChatCommand(line); ok {
 		return a.dispatchChatCommand(cmd)
 	}
@@ -347,6 +360,7 @@ func (a *app) register(state string) error {
 }
 
 func (a *app) heartbeatOnce() error {
+	a.collect()
 	a.mu.Lock()
 	state := a.presence
 	a.mu.Unlock()
@@ -354,6 +368,98 @@ func (a *app) heartbeatOnce() error {
 		state = "available"
 	}
 	return a.register(state)
+}
+
+func (a *app) openBox(ttl time.Duration) error {
+	if a == nil || ttl <= 0 {
+		return nil
+	}
+	box, err := mailbox.Open(mailbox.Config{
+		Dir:      filepath.Join("surface-mailbox", a.myKey),
+		Me:       a.myKey,
+		TTL:      ttl,
+		Endpoint: a.base,
+		Bearer:   a.token,
+		Busy:     func(peer string) bool { return a.registry.Owns(peer) },
+	})
+	if err != nil {
+		return err
+	}
+	a.box = box
+	return nil
+}
+
+func (a *app) dispatchMailbox(line string) (bool, error) {
+	if a == nil || a.box == nil {
+		return false, nil
+	}
+	verb, rest, ok := parseMailboxVerb(line)
+	if !ok {
+		return false, nil
+	}
+	return true, a.handleMailbox(verb, rest)
+}
+
+func parseMailboxVerb(line string) (string, []string, bool) {
+	parts := strings.Fields(line)
+	if len(parts) == 0 {
+		return "", nil, false
+	}
+	switch parts[0] {
+	case "pubkey", "hold", "leave":
+		return parts[0], parts[1:], true
+	default:
+		return "", nil, false
+	}
+}
+
+func (a *app) handleMailbox(verb string, rest []string) error {
+	switch verb {
+	case "pubkey":
+		if len(rest) != 0 {
+			a.println(mailbox.Class(mailbox.ErrInvalid))
+			return nil
+		}
+		a.println(a.box.Public().String())
+	case "hold":
+		if len(rest) != 2 {
+			a.println(mailbox.Class(mailbox.ErrInvalid))
+			return nil
+		}
+		if err := a.box.Hold(rest[0], rest[1]); err != nil {
+			a.println(mailbox.Class(err))
+			return nil
+		}
+	case "leave":
+		if len(rest) < 2 {
+			a.println("leave refused", mailbox.Class(mailbox.ErrInvalid))
+			return nil
+		}
+		_, err := a.box.Leave(a.ctx, rest[0], strings.Join(rest[1:], " "))
+		if err != nil {
+			a.println("leave refused", mailbox.Class(err))
+			return nil
+		}
+		a.println("staged")
+	}
+	return nil
+}
+
+func (a *app) collect() {
+	if a == nil || a.box == nil {
+		return
+	}
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := a.box.Collect(ctx, func(d mailbox.Delivered) error {
+		a.say("left:", d.From, d.Text)
+		return nil
+	})
+	if err != nil && a.logger != nil {
+		a.logger.Warn("mailbox", "op", "collect", "class", mailbox.Class(err))
+	}
 }
 
 func (a *app) heartbeatLoop() {

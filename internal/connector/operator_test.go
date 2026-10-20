@@ -131,6 +131,60 @@ func TestOperatorPrecedence(t *testing.T) {
 	}
 }
 
+func TestMailboxDuration(t *testing.T) {
+	def, err := ParseOperator(nil, nil)
+	if err != nil || def.Mailbox != 0 {
+		t.Fatalf("unset %+v %v", def.Mailbox, err)
+	}
+	if !strings.Contains(ConnectorHelp(), "--mailbox") || !strings.Contains(ConnectorHelp(), "default unset") {
+		t.Fatal(ConnectorHelp())
+	}
+	_, err = ParseOperator([]string{"--mailbox", "0s"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "SURFACE_MAILBOX") || strings.Contains(err.Error(), "0s") {
+		t.Fatalf("zero: %v", err)
+	}
+	got, err := ParseOperator([]string{"--mailbox", "24h"}, nil)
+	if err != nil || got.Mailbox != 24*time.Hour {
+		t.Fatalf("flag %+v %v", got.Mailbox, err)
+	}
+	blank, err := ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_MAILBOX" {
+			return " \t ", true
+		}
+		return "", false
+	})
+	if err != nil || blank.Mailbox != 0 {
+		t.Fatalf("blank %+v %v", blank.Mailbox, err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "mailbox.env")
+	if err := os.WriteFile(path, []byte("SURFACE_MAILBOX=1h\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := ParseOperator([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil || fromFile.Mailbox != time.Hour {
+		t.Fatalf("file %+v %v", fromFile.Mailbox, err)
+	}
+	fromEnv, err := ParseOperator([]string{"--config", path}, func(k string) (string, bool) {
+		if k == "SURFACE_MAILBOX" {
+			return "2h", true
+		}
+		return "", false
+	})
+	if err != nil || fromEnv.Mailbox != 2*time.Hour {
+		t.Fatalf("env %+v %v", fromEnv.Mailbox, err)
+	}
+	fromFlag, err := ParseOperator([]string{"--config", path, "--mailbox", "3h"}, func(k string) (string, bool) {
+		if k == "SURFACE_MAILBOX" {
+			return "2h", true
+		}
+		return "", false
+	})
+	if err != nil || fromFlag.Mailbox != 3*time.Hour {
+		t.Fatalf("flag wins %+v %v", fromFlag.Mailbox, err)
+	}
+}
+
 func TestPunchFlag(t *testing.T) {
 	def, err := ParseOperator(nil, nil)
 	if err != nil {

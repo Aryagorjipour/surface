@@ -22,6 +22,7 @@ type surfaceConfig struct {
 	relay     string
 	punch     string
 	maxChats  int
+	mailbox   time.Duration
 	rest      []string
 }
 
@@ -33,6 +34,8 @@ func surfaceHelp() string {
         resume window (default 60s)
   --pending-poll duration
         pending poll interval (default 2s)
+  --mailbox duration
+        mailbox TTL (default unset)
   --relay address
         relay address (default unset)
   --punch address
@@ -50,6 +53,7 @@ var surfaceFileKeys = map[string]struct{}{
 	"SURFACE_HEARTBEAT_INTERVAL": {},
 	"SURFACE_RESUME_WINDOW":      {},
 	"SURFACE_PENDING_POLL":       {},
+	"SURFACE_MAILBOX":            {},
 	"SURFACE_RELAY":              {},
 	"SURFACE_PUNCH":              {},
 	"SURFACE_MAX_CHATS":          {},
@@ -81,6 +85,7 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	heartbeat := fs.String("heartbeat-interval", "30s", "heartbeat interval")
 	resume := fs.String("resume-window", "60s", "resume window")
 	pending := fs.String("pending-poll", "2s", "pending poll interval")
+	mailboxFlag := fs.String("mailbox", "", "mailbox TTL")
 	relayFlag := fs.String("relay", "", "relay address")
 	punchFlag := fs.String("punch", "", "punch address")
 	maxChatsFlag := fs.String("max-chats", "4", "max concurrent chats")
@@ -163,7 +168,47 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	if err != nil {
 		return surfaceConfig{}, err
 	}
-	return surfaceConfig{heartbeat: hb, resume: window, pending: poll, relay: relay, punch: punch, maxChats: maxChats, rest: fs.Args()}, nil
+	mailboxTTL, err := mailboxDuration(set["mailbox"], *mailboxFlag, lookup, file)
+	if err != nil {
+		return surfaceConfig{}, err
+	}
+	return surfaceConfig{
+		heartbeat: hb,
+		resume:    window,
+		pending:   poll,
+		relay:     relay,
+		punch:     punch,
+		maxChats:  maxChats,
+		mailbox:   mailboxTTL,
+		rest:      fs.Args(),
+	}, nil
+}
+
+func mailboxDuration(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string) (time.Duration, error) {
+	raw := ""
+	set := false
+	switch {
+	case flagSet:
+		raw, set = flagVal, true
+	default:
+		if v, ok := lookup("SURFACE_MAILBOX"); ok {
+			raw, set = v, true
+		} else if v, ok := file["SURFACE_MAILBOX"]; ok {
+			raw, set = v, true
+		}
+	}
+	if !set {
+		return 0, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("SURFACE_MAILBOX not a positive duration")
+	}
+	return d, nil
 }
 
 func pickSurface(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string, name string) (string, bool) {

@@ -28,6 +28,7 @@ type Operator struct {
 	TraceSet        bool
 	Punch           string
 	PunchSet        bool
+	Mailbox         time.Duration
 	Ready           bool
 }
 
@@ -62,6 +63,8 @@ func ConnectorHelp() string {
         trace endpoint (default unset)
   --punch address
         punch listen address (default 127.0.0.1:8081)
+  --mailbox duration
+        mailbox TTL (default unset)
   --ready
         probe http://127.0.0.1:8080/health and exit
   --config path
@@ -86,6 +89,7 @@ var connectorFileKeys = map[string]struct{}{
 	"VAULT_ADDR":                   {},
 	"OTEL_EXPORTER_OTLP_ENDPOINT":  {},
 	"SURFACE_PUNCH_ADDR":           {},
+	"SURFACE_MAILBOX":              {},
 	"SURFACE_CONFIG":               {},
 }
 
@@ -127,6 +131,7 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	secretAddr := fs.String("secret-store-addr", "", "secret store address")
 	trace := fs.String("trace-endpoint", "", "trace endpoint")
 	punch := fs.String("punch", "127.0.0.1:8081", "punch listen address")
+	mailboxFlag := fs.String("mailbox", "", "mailbox TTL")
 	ready := fs.Bool("ready", false, "probe health")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
@@ -196,6 +201,10 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	vaultAddr, vaultSet := pick(set["secret-store-addr"], *secretAddr, lookup, file, "VAULT_ADDR", "", true)
 	traceEndpoint, traceSet := pick(set["trace-endpoint"], *trace, lookup, file, "OTEL_EXPORTER_OTLP_ENDPOINT", "", true)
 	punchAddr, punchSet := resolvePunch(set["punch"], *punch, lookup, file)
+	mailboxTTL, err := mailboxDuration(set["mailbox"], *mailboxFlag, lookup, file)
+	if err != nil {
+		return Operator{}, err
+	}
 
 	return Operator{
 		Listen:          listenAddr,
@@ -211,7 +220,35 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 		TraceSet:        traceSet,
 		Punch:           punchAddr,
 		PunchSet:        punchSet,
+		Mailbox:         mailboxTTL,
 	}, nil
+}
+
+func mailboxDuration(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string) (time.Duration, error) {
+	raw := ""
+	set := false
+	switch {
+	case flagSet:
+		raw, set = flagVal, true
+	default:
+		if v, ok := lookup("SURFACE_MAILBOX"); ok {
+			raw, set = v, true
+		} else if v, ok := file["SURFACE_MAILBOX"]; ok {
+			raw, set = v, true
+		}
+	}
+	if !set {
+		return 0, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("SURFACE_MAILBOX not a positive duration")
+	}
+	return d, nil
 }
 
 // resolvePunch applies flag, then environment, then file. An empty value after trim disables punch.
