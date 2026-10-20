@@ -269,6 +269,101 @@ func TestFailureNoticeEndsPeer(t *testing.T) {
 	}
 }
 
+func TestDeletingCurrentKeyHidesPriorMessages(t *testing.T) {
+	dialer, listener, _ := pair(t)
+	lines := []string{"one", "two", "three"}
+	dialerFrames := make([][]byte, 0, len(lines))
+	listenerFrames := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		frame, err := Seal(dialer, "d-"+line, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dialerFrames = append(dialerFrames, frame)
+		got, display, err := Open(listener, frame)
+		if err != nil || !display || got != "d-"+line {
+			t.Fatalf("dialer line %q %v %v", got, display, err)
+		}
+	}
+	for _, line := range lines {
+		frame, err := Seal(listener, "l-"+line, Highest(dialer))
+		if err != nil {
+			t.Fatal(err)
+		}
+		listenerFrames = append(listenerFrames, frame)
+		got, display, err := Open(dialer, frame)
+		if err != nil || !display || got != "l-"+line {
+			t.Fatalf("listener line %q %v %v", got, display, err)
+		}
+	}
+	again, display, err := Open(listener, dialerFrames[0])
+	if err != nil || display || again != "d-one" {
+		t.Fatalf("replay %q %v %v", again, display, err)
+	}
+
+	tail, err := Seal(dialer, "tail", Highest(listener))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, display, err := Open(listener, tail)
+	if err != nil || !display || got != "tail" {
+		t.Fatalf("tail %q %v %v", got, display, err)
+	}
+
+	prior := append(append([][]byte{}, dialerFrames...), listenerFrames...)
+	prior = append(prior, tail)
+	if keyOpens(t, dialer.send, dirDialer, dialerFrames) || keyOpens(t, dialer.send, dirDialer, [][]byte{tail}) {
+		t.Fatal("dialer send key opened an earlier dialer frame")
+	}
+	if keyOpens(t, listener.recv, dirDialer, dialerFrames) || keyOpens(t, listener.recv, dirDialer, [][]byte{tail}) {
+		t.Fatal("listener recv key opened an earlier dialer frame")
+	}
+	if keyOpens(t, listener.send, dirListener, listenerFrames) {
+		t.Fatal("listener send key opened an earlier listener frame")
+	}
+	if keyOpens(t, dialer.recv, dirListener, listenerFrames) {
+		t.Fatal("dialer recv key opened an earlier listener frame")
+	}
+	if keyOpens(t, dialer.resume, dirDialer, prior) || keyOpens(t, listener.resume, dirListener, prior) {
+		t.Fatal("resume key opened a chat frame")
+	}
+
+	dropKey(dialer)
+	dropKey(listener)
+	for _, frame := range prior {
+		if _, _, err := Open(listener, frame); err == nil {
+			t.Fatal("listener opened prior ciphertext after the key was deleted")
+		}
+		if _, _, err := Open(dialer, frame); err == nil {
+			t.Fatal("dialer opened prior ciphertext after the key was deleted")
+		}
+	}
+}
+
+func keyOpens(t *testing.T, key []byte, dir byte, frames [][]byte) bool {
+	t.Helper()
+	stolen := append([]byte(nil), key...)
+	for _, frame := range frames {
+		_, seq, _, ct, err := parseChat(frame)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openGCM(stolen, dir, seq, ct); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func dropKey(s *Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.send)
+	clear(s.recv)
+	s.send = nil
+	s.recv = nil
+}
+
 func offerEph(t *testing.T, offer []byte) []byte {
 	t.Helper()
 	eph, _, err := splitOffer(offer)
