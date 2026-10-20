@@ -9,7 +9,8 @@ The pull request says what a person can observe. Link a public issue when
 one exists.
 
 Published checks must pass before acceptance. Those checks are vet, test,
-both program builds (`cmd/connector` and `cmd/surface`), and lint.
+both program builds (`cmd/connector` and `cmd/surface`), the reproducible
+release build, govulncheck, and lint.
 
 A change that adds behavior includes a check that fails before the change
 and passes after it.

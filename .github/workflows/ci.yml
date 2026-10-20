@@ -31,6 +31,34 @@ jobs:
           go build -o bin/connector ./cmd/connector
           go build -o bin/surface ./cmd/surface
 
+  vuln:
+    name: Vuln
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: bash scripts/govulncheck.sh
+
+  release:
+    name: Release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Reproducible release build
+        run: bash scripts/release_test.sh
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
