@@ -17,7 +17,6 @@ func (a Addr) String() string {
 	return a.raw
 }
 
-// Parse requires both the listen round-trip and the http URL host to equal the input, so callers store one spelling.
 func Parse(raw string) (Addr, error) {
 	host, port, err := net.SplitHostPort(raw)
 	if err != nil {
