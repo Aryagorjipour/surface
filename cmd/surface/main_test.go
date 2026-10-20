@@ -115,7 +115,7 @@ func TestHeartbeatRepeatsPresence(t *testing.T) {
 	a := &app{
 		base:       srv.URL,
 		myKey:      "busy-key",
-		listenAddr: "203.0.113.10:10",
+		listenAddr: mustAddr(t, "203.0.113.10:10"),
 		token:      "surface-test-bearer",
 		presence:   "busy",
 		ctx:        context.Background(),
@@ -186,7 +186,7 @@ func TestLogsOmitKeyAndAddress(t *testing.T) {
 	a := &app{
 		base:       dead,
 		myKey:      key,
-		listenAddr: addr,
+		listenAddr: mustAddr(t, addr),
 		token:      token,
 		heartbeat:  20 * time.Millisecond,
 		logger:     logger,
@@ -494,7 +494,7 @@ func TestConnectReportsRateLimit(t *testing.T) {
 	a := &app{
 		base:       srv.URL,
 		myKey:      "bob",
-		listenAddr: "127.0.0.1:9002",
+		listenAddr: mustAddr(t, "127.0.0.1:9002"),
 		token:      "dev",
 		ctx:        context.Background(),
 	}

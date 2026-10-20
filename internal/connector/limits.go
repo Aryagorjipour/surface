@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/Aryagorjipour/surface/internal/hostport"
 )
 
 const window = 60 * time.Second
@@ -197,6 +199,9 @@ func ValidateRegister(cfg Config, key, address, state string) (Fault, bool) {
 	if state != "available" && state != "busy" && state != "offline" {
 		return bad("invalid state")
 	}
+	if _, err := hostport.Parse(address); err != nil {
+		return bad("invalid address")
+	}
 	return Fault{}, true
 }
 
@@ -210,6 +215,9 @@ func ValidateConnect(cfg Config, fromKey, toKey, fromAddress string) (Fault, boo
 	}
 	if over(fromAddress, cfg.MaxAddressChars) {
 		return bad("address too long")
+	}
+	if _, err := hostport.Parse(fromAddress); err != nil {
+		return bad("invalid address")
 	}
 	return Fault{}, true
 }

@@ -17,6 +17,7 @@ import (
 
 	"log/slog"
 
+	"github.com/Aryagorjipour/surface/internal/hostport"
 	"github.com/Aryagorjipour/surface/internal/mailbox"
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/Aryagorjipour/surface/internal/shared"
@@ -39,7 +40,7 @@ type connectResp struct {
 type app struct {
 	base         string
 	myKey        string
-	listenAddr   string
+	listenAddr   hostport.Addr
 	token        string
 	heartbeat    time.Duration
 	resumeWindow time.Duration
@@ -90,9 +91,13 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	if token == "" {
 		return errors.New("SURFACE_CONNECTOR_TOKEN is required")
 	}
-	listenAddr := "127.0.0.1:9001"
+	rawListen := "127.0.0.1:9001"
 	if len(cfg.rest) > 2 {
-		listenAddr = cfg.rest[2]
+		rawListen = cfg.rest[2]
+	}
+	listenAddr, err := hostport.Parse(rawListen)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -346,7 +351,7 @@ func (a *app) register(state string) error {
 	a.presence = state
 	a.mu.Unlock()
 	body, _ := json.Marshal(map[string]string{
-		"key": a.myKey, "address": a.listenAddr, "state": state,
+		"key": a.myKey, "address": a.listenAddr.String(), "state": state,
 	})
 	resp, err := a.do(http.MethodPost, a.base+"/peers", body)
 	if err != nil {
@@ -588,7 +593,7 @@ func (a *app) doConnect(target string) error {
 	}
 
 	body, _ := json.Marshal(map[string]string{
-		"from_key": a.myKey, "to_key": target, "from_address": a.listenAddr,
+		"from_key": a.myKey, "to_key": target, "from_address": a.listenAddr.String(),
 	})
 	resp, err := a.do(http.MethodPost, a.base+"/connect", body)
 	if err != nil {
@@ -660,7 +665,7 @@ func (a *app) serveWS() {
 		}
 		a.onIncoming(c)
 	})
-	srv := &http.Server{Addr: a.listenAddr, Handler: mux}
+	srv := &http.Server{Addr: a.listenAddr.String(), Handler: mux}
 	go func() {
 		<-a.ctx.Done()
 		if err := srv.Shutdown(context.Background()); err != nil && a.logger != nil {
@@ -679,7 +684,7 @@ func (a *app) onIncoming(c byteConn) {
 		admitted = true
 		id := a.gate.idOf(sess)
 		peer := a.callerFor(id)
-		if a.beginChat(c, sess, false, "", ConvID(id), peer) {
+		if a.beginChat(c, sess, false, hostport.Addr{}, ConvID(id), peer) {
 			a.say("\n" + connectedPrompt(false))
 			return
 		}
@@ -729,7 +734,7 @@ func (a *app) callerFor(id string) string {
 	return body.From
 }
 
-func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr string, id ConvID, peer string) bool {
+func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hostport.Addr, id ConvID, peer string) bool {
 	a.initRegistry()
 	_, err := a.registry.Attach(AttachReq{
 		ID:     id,

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Aryagorjipour/surface/internal/hostport"
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/coder/websocket"
 )
@@ -21,7 +22,30 @@ var (
 	dialTimeout   = 2 * time.Second
 	acceptPoll    = time.Second
 	punchEvery    = 100 * time.Millisecond
+	wsClient      = &http.Client{Transport: happyTransport()}
 )
+
+func happyTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = happyDial
+	return tr
+}
+
+func happyDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := net.Dialer{
+		Timeout:       30 * time.Second,
+		KeepAlive:     30 * time.Second,
+		FallbackDelay: 300 * time.Millisecond,
+	}
+	return dialer.DialContext(ctx, network, addr)
+}
+
+func dialWebSocket(ctx context.Context, addr hostport.Addr) (*websocket.Conn, error) {
+	conn, _, err := websocket.Dial(ctx, "ws://"+addr.String(), &websocket.DialOptions{
+		HTTPClient: wsClient,
+	})
+	return conn, err
+}
 
 func setAttemptBudget(d time.Duration) { attemptBudget = d }
 
@@ -110,9 +134,13 @@ func (a *app) waitConnected(ctx context.Context, d time.Duration, id string) boo
 	}
 }
 
-func (a *app) dialDirect(ctx context.Context, addr, id, caller, target string, proof []byte) bool {
+func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, proof []byte) bool {
+	addr, err := hostport.Parse(raw)
+	if err != nil {
+		return false
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	c, _, err := websocket.Dial(dialCtx, "ws://"+addr, nil)
+	c, err := dialWebSocket(dialCtx, addr)
 	cancel()
 	if err != nil {
 		return false
@@ -273,7 +301,11 @@ func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAdd
 		if err != nil {
 			continue
 		}
-		if a.beginChat(link, sess, true, remote.String(), ConvID(id), target) {
+		addr, err := hostport.Parse(remote.String())
+		if err != nil {
+			return false
+		}
+		if a.beginChat(link, sess, true, addr, ConvID(id), target) {
 			a.say(connectedPrompt(true))
 			return true
 		}
@@ -302,7 +334,11 @@ func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPA
 		if reused || sess == nil {
 			continue
 		}
-		if a.beginChat(link, sess, false, remote.String(), ConvID(id), caller) {
+		addr, err := hostport.Parse(remote.String())
+		if err != nil {
+			return false
+		}
+		if a.beginChat(link, sess, false, addr, ConvID(id), caller) {
 			a.say("\n" + connectedPrompt(false))
 			return true
 		}
@@ -376,7 +412,7 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []
 		if err != nil {
 			return
 		}
-		if a.beginChat(link, sess, true, "", ConvID(id), target) {
+		if a.beginChat(link, sess, true, hostport.Addr{}, ConvID(id), target) {
 			owned = false
 			a.say(connectedPrompt(true))
 		}
@@ -393,7 +429,7 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof []
 	if err := link.Write(ctx, websocket.MessageBinary, reply); err != nil {
 		return
 	}
-	if a.beginChat(link, sess, false, "", ConvID(id), caller) {
+	if a.beginChat(link, sess, false, hostport.Addr{}, ConvID(id), caller) {
 		owned = false
 		a.say("\n" + connectedPrompt(false))
 	}

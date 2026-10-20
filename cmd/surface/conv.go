@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Aryagorjipour/surface/internal/hostport"
 	"github.com/Aryagorjipour/surface/internal/session"
 	"github.com/coder/websocket"
 )
@@ -38,7 +39,7 @@ type Conversation struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	dialer bool
-	addr   string
+	addr   hostport.Addr
 	window time.Duration
 	reg    *Registry
 
@@ -58,7 +59,7 @@ type AttachReq struct {
 	Sess   *session.Session
 	Conn   byteConn
 	Dialer bool
-	Addr   string
+	Addr   hostport.Addr
 }
 
 func (c *Conversation) ID() ConvID   { return c.id }
@@ -412,7 +413,7 @@ func (c *Conversation) retryDial() {
 		addr := c.addr
 		stop := c.quitting || c.ended
 		c.stateMu.Unlock()
-		if stop || sess == nil || addr == "" {
+		if stop || sess == nil || addr.String() == "" {
 			return
 		}
 		if !time.Now().Before(until) {
@@ -445,7 +446,7 @@ func (c *Conversation) retryDial() {
 			}
 			return
 		}
-		conn, _, err := websocket.Dial(c.ctx, "ws://"+addr, nil)
+		conn, err := dialWebSocket(c.ctx, addr)
 		if err != nil {
 			continue
 		}
