@@ -97,7 +97,7 @@ func TestRejectMalformed(t *testing.T) {
 	longKey := strings.Repeat("k", 129)
 	longAddr := strings.Repeat("a", 257)
 	maxKey := strings.Repeat("k", 128)
-	maxAddr := strings.Repeat("a", 256)
+	maxAddr := strings.Repeat("a", 254) + ":1"
 
 	rec := postMux(mux, "/peers", peerJSON(longKey, "127.0.0.1:1", "available"))
 	requirePhrase(t, rec, http.StatusBadRequest, "key too long")
@@ -706,13 +706,13 @@ func TestExpiryLogsBare(t *testing.T) {
 	const (
 		peerKey  = "bare-peer-key-9f"
 		peerAddr = "203.0.113.77:77"
-		secret   = "test-secret-do-not-log"
+		fromAddr = "203.0.113.98:98"
 	)
 	rec := postMux(mux, "/peers", peerJSON(peerKey, peerAddr, "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
 	}
-	id := mustConnect(t, mux, "bare-caller", peerKey, secret)
+	id := mustConnect(t, mux, "bare-caller", peerKey, fromAddr)
 	now = now.Add(2 * time.Second)
 	before := len(capture.all())
 	h.pruneOnce(context.Background())
@@ -723,7 +723,7 @@ func TestExpiryLogsBare(t *testing.T) {
 	var sawRequests, sawPeers bool
 	for _, record := range records[before:] {
 		text := recordText(record)
-		if strings.Contains(text, peerAddr) || strings.Contains(text, peerKey) || strings.Contains(text, id) || strings.Contains(text, secret) {
+		if strings.Contains(text, peerAddr) || strings.Contains(text, peerKey) || strings.Contains(text, id) || strings.Contains(text, fromAddr) {
 			t.Fatalf("expiry log included a private value: %s", text)
 		}
 		count := attrInt(record, "count")

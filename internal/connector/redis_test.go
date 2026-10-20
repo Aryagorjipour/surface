@@ -142,7 +142,7 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	freshKey := "connect-fresh-" + suffix
 	const (
 		staleAddr = "203.0.113.77:77"
-		secret    = "test-secret-do-not-log"
+		fromAddr  = "203.0.113.99:99"
 	)
 	t.Cleanup(func() {
 		_ = cache.client.Del(ctx, "peer:"+staleKey, "peer:"+freshKey, "pending:"+freshKey).Err()
@@ -165,7 +165,7 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Second)
-	rec = postMux(mux, "/connect", connectJSON("connect-caller", staleKey, secret))
+	rec = postMux(mux, "/connect", connectJSON("connect-caller", staleKey, fromAddr))
 	requirePhrase(t, rec, http.StatusNotFound, "target not found")
 	if strings.Contains(rec.Body.String(), staleAddr) || strings.Contains(rec.Body.String(), staleKey) {
 		t.Fatalf("connect body %s", rec.Body.String())
@@ -182,7 +182,7 @@ func TestConnectDropsStalePeerCache(t *testing.T) {
 	}
 	for _, record := range capture.all() {
 		text := recordText(record)
-		if strings.Contains(text, staleKey) || strings.Contains(text, staleAddr) || strings.Contains(text, secret) {
+		if strings.Contains(text, staleKey) || strings.Contains(text, staleAddr) || strings.Contains(text, fromAddr) {
 			t.Fatalf("connect log included a private value: %s", text)
 		}
 	}

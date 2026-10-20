@@ -33,10 +33,14 @@ func TestValidateBounds(t *testing.T) {
 		t.Fatalf("empty key: ok=%v fault=%+v", ok, f)
 	}
 	f, ok = ValidateRegister(cfg, "  a", " z ", "available")
-	if !ok {
-		t.Fatalf("untrimmed values refused: %+v", f)
+	if ok || f.Phrase != "invalid address" {
+		t.Fatalf("untrimmed address: ok=%v fault=%+v", ok, f)
 	}
-	if _, ok = ValidateRegister(cfg, maxKey, maxAddr, "available"); !ok {
+	ceilingAddr := strings.Repeat("a", 254) + ":1"
+	if len(ceilingAddr) != cfg.MaxAddressChars {
+		t.Fatalf("ceiling address length %d", len(ceilingAddr))
+	}
+	if _, ok = ValidateRegister(cfg, maxKey, ceilingAddr, "available"); !ok {
 		t.Fatal("exact ceilings refused")
 	}
 	if _, ok = ValidateRegister(cfg, runeKey, "127.0.0.1:1", "busy"); !ok {
@@ -62,6 +66,22 @@ func TestValidateBounds(t *testing.T) {
 	f, ok = ValidateConnect(cfg, "", "to", "addr")
 	if ok || f.Phrase != "from_key, to_key, from_address required" {
 		t.Fatalf("missing connect: ok=%v fault=%+v", ok, f)
+	}
+	for _, addr := range []string{"[::1]:9001", "127.0.0.1:1"} {
+		if _, ok = ValidateRegister(cfg, "k", addr, "available"); !ok {
+			t.Fatalf("register %s refused", addr)
+		}
+		if _, ok = ValidateConnect(cfg, "from", "to", addr); !ok {
+			t.Fatalf("connect %s refused", addr)
+		}
+	}
+	f, ok = ValidateRegister(cfg, "k", "::1:9001", "available")
+	if ok || f.Phrase != "invalid address" {
+		t.Fatalf("register bare ipv6: ok=%v fault=%+v", ok, f)
+	}
+	f, ok = ValidateConnect(cfg, "from", "to", "::1:9001")
+	if ok || f.Phrase != "invalid address" {
+		t.Fatalf("connect bare ipv6: ok=%v fault=%+v", ok, f)
 	}
 
 	if _, ok = ValidateKey(cfg, maxKey); !ok {
