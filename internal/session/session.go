@@ -2,6 +2,7 @@
 package session
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -29,6 +30,10 @@ const (
 
 	dirDialer   = 0x01
 	dirListener = 0x02
+
+	chainBytes   = 32
+	chainMessage = 0x01
+	chainNext    = 0x02
 )
 
 var (
@@ -63,20 +68,34 @@ type offerState struct {
 	eph       []byte
 }
 
-// Session is one admitted direct chat. Its key stays in this process.
+type replay struct {
+	frame []byte
+	plain string
+}
+
+func (r replay) match(frame []byte) (string, bool) {
+	if !bytes.Equal(r.frame, frame) {
+		return "", false
+	}
+	return r.plain, true
+}
+
+// Session is one admitted direct chat. Its chain keys stay in this process.
 type Session struct {
 	mu       sync.Mutex
 	request  string
 	caller   string
 	target   string
 	sendDir  byte
-	key      []byte
+	send     []byte
+	recv     []byte
 	resume   []byte
 	nextSend uint64
 	nextRecv uint64
 	highest  uint64
 	peerAck  uint64
 	sent     map[uint64][]byte
+	opened   map[uint64]replay
 	finished bool
 	notice   []byte
 }
@@ -180,6 +199,9 @@ func Open(sess *Session, frame []byte) (plaintext string, display bool, err erro
 	if sess.finished {
 		return "", false, errFinished
 	}
+	if len(sess.send) != chainBytes || len(sess.recv) != chainBytes {
+		return "", false, sess.failLocked()
+	}
 	typ, seq, ack, ct, perr := parseChat(frame)
 	if perr != nil {
 		return "", false, sess.failLocked()
@@ -191,25 +213,46 @@ func Open(sess *Session, frame []byte) (plaintext string, display bool, err erro
 	if seq == 0 || seq > sess.nextRecv {
 		return "", false, sess.failLocked()
 	}
-	plain, oerr := openGCM(sess.key, otherDir(sess.sendDir), seq, ct)
+	if seq < sess.nextRecv {
+		return sess.replayLocked(seq, frame)
+	}
+	mk, next := chainStep(sess.recv)
+	defer clear(mk)
+	plain, oerr := openGCM(mk, otherDir(sess.sendDir), seq, ct)
 	if oerr != nil {
+		clear(next)
 		return "", false, sess.failLocked()
 	}
 	if typ == typeEnd {
 		if plain != "" {
+			clear(next)
 			return "", false, sess.failLocked()
 		}
+		clear(sess.recv)
+		sess.recv = next
 		sess.finished = true
 		return "", false, nil
 	}
-	if seq < sess.nextRecv {
-		return plain, false, nil
-	}
+	sess.opened[seq] = replay{frame: append([]byte(nil), frame...), plain: plain}
+	clear(sess.recv)
+	sess.recv = next
 	sess.nextRecv = seq + 1
 	if seq > sess.highest {
 		sess.highest = seq
 	}
 	return plain, true, nil
+}
+
+func (s *Session) replayLocked(seq uint64, frame []byte) (string, bool, error) {
+	held, ok := s.opened[seq]
+	if !ok {
+		return "", false, s.failLocked()
+	}
+	plain, match := held.match(frame)
+	if !match {
+		return "", false, s.failLocked()
+	}
+	return plain, false, nil
 }
 
 // failLocked seals one empty end frame for the peer, then marks this side finished.
@@ -336,9 +379,15 @@ func (s *Session) sealLocked(typ byte, plaintext string, ack uint64) ([]byte, er
 	if s.finished {
 		return nil, errFinished
 	}
+	if len(s.send) != chainBytes {
+		return nil, errRefused
+	}
 	seq := s.nextSend
-	ct, err := sealGCM(s.key, s.sendDir, seq, []byte(plaintext))
+	mk, next := chainStep(s.send)
+	defer clear(mk)
+	ct, err := sealGCM(mk, s.sendDir, seq, []byte(plaintext))
 	if err != nil {
+		clear(next)
 		return nil, err
 	}
 	frame := make([]byte, 21+len(ct))
@@ -351,6 +400,8 @@ func (s *Session) sealLocked(typ byte, plaintext string, ack uint64) ([]byte, er
 		s.sent = make(map[uint64][]byte)
 	}
 	s.sent[seq] = append([]byte(nil), frame...)
+	clear(s.send)
+	s.send = next
 	s.nextSend = seq + 1
 	return frame, nil
 }
@@ -373,12 +424,24 @@ func (s *Session) resumeMsg(typ byte) []byte {
 }
 
 func newSession(sendDir byte, requestID, callerKey, targetKey string, shared, proof []byte) (*Session, error) {
-	key, err := derive(shared, proof, callerKey, targetKey, "surface-session-v1")
+	defer clear(shared)
+	sendLabel, recvLabel := "surface-chain-dialer-v1", "surface-chain-listener-v1"
+	if sendDir == dirListener {
+		sendLabel, recvLabel = recvLabel, sendLabel
+	}
+	send, err := derive(shared, proof, callerKey, targetKey, sendLabel)
 	if err != nil {
+		return nil, err
+	}
+	recv, err := derive(shared, proof, callerKey, targetKey, recvLabel)
+	if err != nil {
+		clear(send)
 		return nil, err
 	}
 	resume, err := derive(shared, proof, callerKey, targetKey, "surface-resume-v1")
 	if err != nil {
+		clear(send)
+		clear(recv)
 		return nil, err
 	}
 	return &Session{
@@ -386,16 +449,24 @@ func newSession(sendDir byte, requestID, callerKey, targetKey string, shared, pr
 		caller:   callerKey,
 		target:   targetKey,
 		sendDir:  sendDir,
-		key:      key,
+		send:     send,
+		recv:     recv,
 		resume:   resume,
 		nextSend: 1,
 		nextRecv: 1,
 		sent:     make(map[uint64][]byte),
+		opened:   make(map[uint64]replay),
 	}, nil
 }
 
+func chainStep(chain []byte) (messageKey, next []byte) {
+	messageKey = proofMAC(chain, []byte{chainMessage})
+	next = proofMAC(chain, []byte{chainNext})
+	return messageKey, next
+}
+
 func derive(shared, proof []byte, caller, target, label string) ([]byte, error) {
-	return hkdf.Key(sha256.New, shared, proof, label+caller+target, 32)
+	return hkdf.Key(sha256.New, shared, proof, label+caller+target, chainBytes)
 }
 
 func newEph() (*ecdh.PrivateKey, []byte, error) {
