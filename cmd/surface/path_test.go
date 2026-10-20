@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Aryagorjipour/surface/internal/connector"
+	"github.com/Aryagorjipour/surface/internal/hostport"
 	"github.com/coder/websocket"
 )
 
@@ -51,7 +53,32 @@ func TestPathHarnesses(t *testing.T) {
 		acceptPath(t, base, token, listener)
 		waitPathLine(t, dialer.buf, connectedPrompt(true), 2*time.Second)
 		waitPathLine(t, listener.buf, connectedPrompt(false), 2*time.Second)
-		if !exactLine(dialer.buf.String(), "accepted — dialing "+listener.app.listenAddr) {
+		if !exactLine(dialer.buf.String(), "accepted — dialing "+listener.app.listenAddr.String()) {
+			t.Fatalf("dialer lines %q", dialer.buf.String())
+		}
+		assertPathConnected(t, dialer.buf, listener.buf)
+		stdout := exchangePath(t, dialer.app, listener.app)
+		if strings.Count(stdout, "peer: surface-round-trip") < 1 {
+			t.Fatalf("stdout %q", stdout)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if packets.Load() != before {
+			t.Fatalf("punch packets %d", packets.Load()-before)
+		}
+	})
+
+	t.Run("ipv6", func(t *testing.T) {
+		dialer := startPathSurface(t, base, token, "v6-alice", punchAddr, "", "[::1]:0")
+		listener := startPathSurface(t, base, token, "v6-bob", punchAddr, "", "[::1]:0")
+		before := packets.Load()
+		go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
+		acceptPath(t, base, token, listener)
+		waitPathLine(t, dialer.buf, connectedPrompt(true), 2*time.Second)
+		waitPathLine(t, listener.buf, connectedPrompt(false), 2*time.Second)
+		if !strings.HasPrefix(listener.app.listenAddr.String(), "[::1]:") {
+			t.Fatalf("listen %s", listener.app.listenAddr.String())
+		}
+		if !exactLine(dialer.buf.String(), "accepted — dialing "+listener.app.listenAddr.String()) {
 			t.Fatalf("dialer lines %q", dialer.buf.String())
 		}
 		assertPathConnected(t, dialer.buf, listener.buf)
@@ -125,7 +152,7 @@ func TestPathHarnesses(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		conn, _, err := websocket.Dial(ctx, "ws://"+listener.app.listenAddr, nil)
+		conn, _, err := websocket.Dial(ctx, "ws://"+listener.app.listenAddr.String(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -380,16 +407,16 @@ func startCountingSplicer(t *testing.T) (string, *atomic.Int64) {
 
 func startPathPair(t *testing.T, base, token, dialerKey, listenerKey, dialerPunch, dialerRelay, listenerPunch, listenerRelay string) (*pathApp, *pathApp) {
 	t.Helper()
-	dialer := startPathSurface(t, base, token, dialerKey, dialerPunch, dialerRelay)
-	listener := startPathSurface(t, base, token, listenerKey, listenerPunch, listenerRelay)
+	dialer := startPathSurface(t, base, token, dialerKey, dialerPunch, dialerRelay, "127.0.0.1:0")
+	listener := startPathSurface(t, base, token, listenerKey, listenerPunch, listenerRelay, "127.0.0.1:0")
 	return dialer, listener
 }
 
-func startPathSurface(t *testing.T, base, token, key, punch, relay string) *pathApp {
+func startPathSurface(t *testing.T, base, token, key, punch, relay, bind string) *pathApp {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", bind)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +426,7 @@ func startPathSurface(t *testing.T, base, token, key, punch, relay string) *path
 	a := &app{
 		base:         base,
 		myKey:        key,
-		listenAddr:   addr,
+		listenAddr:   mustAddr(t, addr),
 		token:        token,
 		heartbeat:    time.Hour,
 		resumeWindow: time.Minute,
@@ -620,4 +647,61 @@ func exchangePath(t *testing.T, dialer, listener *app) string {
 		}
 		time.Sleep(500 * time.Millisecond)
 	})
+}
+
+func mustAddr(t *testing.T, raw string) hostport.Addr {
+	t.Helper()
+	addr, err := hostport.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+func TestDialWebSocketLocalhost(t *testing.T) {
+	for _, bind := range []string{"127.0.0.1:0", "[::1]:0"} {
+		t.Run(bind, func(t *testing.T) {
+			ln, err := net.Listen("tcp", bind)
+			if err != nil {
+				t.Skip(err.Error())
+			}
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				c, err := websocket.Accept(w, r, nil)
+				if err != nil {
+					return
+				}
+				_ = c.Close(websocket.StatusNormalClosure, "")
+			})
+			srv := &http.Server{Handler: mux}
+			go func() { _ = srv.Serve(ln) }()
+			t.Cleanup(func() { _ = srv.Close() })
+
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				probe, dialErr := net.DialTimeout("tcp", ln.Addr().String(), 50*time.Millisecond)
+				if dialErr == nil {
+					_ = probe.Close()
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal(dialErr)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+
+			tcp, ok := ln.Addr().(*net.TCPAddr)
+			if !ok || tcp.Port == 0 {
+				t.Fatalf("listener %v", ln.Addr())
+			}
+			addr := mustAddr(t, net.JoinHostPort("localhost", strconv.Itoa(tcp.Port)))
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			conn, err := dialWebSocket(ctx, addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+		})
+	}
 }
