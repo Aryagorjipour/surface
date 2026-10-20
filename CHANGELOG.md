@@ -4,6 +4,7 @@
 
 ### Added
 
+- With `--census` or `SURFACE_CENSUS` set, an authenticated caller can read `GET /operator/peers` and `GET /operator/pending`. Each body is a count. Both routes stay off unless that setting is on.
 - A tag `vMAJOR.MINOR.PATCH` publishes `connector` and `surface` binaries, `SHA256SUMS`, and a signed SLSA provenance attestation.
 - A direct chat uses a fresh key for each message. The current key cannot read earlier messages.
 - With `SURFACE_MAILBOX` set to a positive duration, Surface can leave one short encrypted line for a peer who is not in a chat. The connector stores the ciphertext until that peer collects it, or until the duration ends.

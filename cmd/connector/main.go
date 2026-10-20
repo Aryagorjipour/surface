@@ -103,6 +103,7 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 
 	h := connector.NewHandlers(store, cache, logger)
 	h.SetBearer(secrets.ConnectorToken)
+	h.SetCensus(op.Census)
 	h.SetLimits(connector.NewLimits(op.Limits))
 	h.SetLifetime(op.RequestLifetime)
 	window := 3 * op.Heartbeat

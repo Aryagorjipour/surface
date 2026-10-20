@@ -43,6 +43,7 @@ type Handlers struct {
 	lifetime   time.Duration
 	silence    time.Duration
 	bearer     string
+	census     bool
 	punchMu    sync.Mutex
 	punch      *punchBook
 }
@@ -84,6 +85,14 @@ func (h *Handlers) SetBearer(token string) {
 		return
 	}
 	h.bearer = token
+}
+
+// SetCensus turns the operator count routes on. A later call still applies.
+func (h *Handlers) SetCensus(on bool) {
+	if h == nil {
+		return
+	}
+	h.census = on
 }
 
 // SetSilenceWindow installs the liveness window on the handlers and the store.
@@ -134,6 +143,8 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	h.route(mux, "POST /requests/{id}/reject", "reject", h.handleReject)
 	h.route(mux, "GET /requests/{id}", "status", h.handleRequestStatus)
 	h.route(mux, "POST /requests/{id}/punch", "punch", h.handlePunch)
+	h.route(mux, "GET /operator/peers", "census-peers", h.handleCensusPeers)
+	h.route(mux, "GET /operator/pending", "census-pending", h.handleCensusPending)
 	mux.HandleFunc("GET /health", h.handleHealth)
 	// An extra path still uses this handler, so the span stays GET /health.
 	mux.HandleFunc("GET /health/", h.handleHealth)
@@ -390,6 +401,51 @@ func (h *Handlers) handleConnect(w http.ResponseWriter, r *http.Request) {
 		"request_id": cr.ID,
 		"status":     cr.Status,
 	})
+}
+
+type countResponse struct {
+	Count int `json:"count"`
+}
+
+func (h *Handlers) handleCensusPeers(w http.ResponseWriter, r *http.Request) {
+	h.serveCount(w, r, "count peers", func() (int, error) {
+		return h.store.CountLivePeers(r.Context(), h.clock(), h.silenceWindow())
+	})
+}
+
+func (h *Handlers) handleCensusPending(w http.ResponseWriter, r *http.Request) {
+	h.serveCount(w, r, "count pending", func() (int, error) {
+		return h.pendingCount(), nil
+	})
+}
+
+func (h *Handlers) serveCount(w http.ResponseWriter, r *http.Request, op string, count func() (int, error)) {
+	if !h.census {
+		h.reject(w, http.StatusNotFound, op, "not found")
+		return
+	}
+	n, err := count()
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Error(op, "err", err)
+		}
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	h.writeJSON(w, 0, countResponse{Count: n})
+}
+
+func (h *Handlers) pendingCount() int {
+	now := h.clock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	n := 0
+	for _, cr := range h.byID {
+		if cr != nil && cr.Status == "pending" && RequestReadable(now, cr.expiresAt) {
+			n++
+		}
+	}
+	return n
 }
 
 func (h *Handlers) handlePending(w http.ResponseWriter, r *http.Request) {

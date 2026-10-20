@@ -170,6 +170,21 @@ func (s *Store) Prune(ctx context.Context, now time.Time, window time.Duration) 
 	return keys, nil
 }
 
+// CountLivePeers counts rows whose last_seen is still inside the silence window.
+// The query does not select keys and does not decrypt addresses.
+func (s *Store) CountLivePeers(ctx context.Context, now time.Time, window time.Duration) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("no store")
+	}
+	cutoff := now.Add(-window).Unix()
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM peers WHERE last_seen >= ?`, cutoff).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 func (s *Store) GetPeer(ctx context.Context, key string) (address, state string, lastSeen time.Time, err error) {
 	const q = `SELECT address_enc, address_nonce, state, last_seen FROM peers WHERE key = ?`
 	var ct, nonce []byte

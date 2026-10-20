@@ -185,6 +185,90 @@ func TestMailboxDuration(t *testing.T) {
 	}
 }
 
+func TestCensusSwitch(t *testing.T) {
+	def, err := ParseOperator(nil, nil)
+	if err != nil || def.Census {
+		t.Fatalf("unset %+v %v", def.Census, err)
+	}
+	if !strings.Contains(ConnectorHelp(), "--census") || !strings.Contains(ConnectorHelp(), "default off") {
+		t.Fatal(ConnectorHelp())
+	}
+
+	on, err := ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return "TRUE", true
+		}
+		return "", false
+	})
+	if err != nil || !on.Census {
+		t.Fatalf("true %+v %v", on.Census, err)
+	}
+	off, err := ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return " 0 ", true
+		}
+		return "", false
+	})
+	if err != nil || off.Census {
+		t.Fatalf("zero %+v %v", off.Census, err)
+	}
+	blank, err := ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return " \t ", true
+		}
+		return "", false
+	})
+	if err != nil || blank.Census {
+		t.Fatalf("blank %+v %v", blank.Census, err)
+	}
+	_, err = ParseOperator(nil, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return "yes-not-a-bool", true
+		}
+		return "", false
+	})
+	if err == nil || !strings.Contains(err.Error(), "SURFACE_CENSUS") || strings.Contains(err.Error(), "yes-not-a-bool") {
+		t.Fatalf("bad: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "census.env")
+	if err := os.WriteFile(path, []byte("SURFACE_CENSUS=1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := ParseOperator([]string{"--config", path}, func(string) (string, bool) { return "", false })
+	if err != nil || !fromFile.Census {
+		t.Fatalf("file %+v %v", fromFile.Census, err)
+	}
+	fromEnv, err := ParseOperator([]string{"--config", path}, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return "false", true
+		}
+		return "", false
+	})
+	if err != nil || fromEnv.Census {
+		t.Fatalf("env %+v %v", fromEnv.Census, err)
+	}
+	fromFlag, err := ParseOperator([]string{"--config", path, "--census"}, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return "false", true
+		}
+		return "", false
+	})
+	if err != nil || !fromFlag.Census {
+		t.Fatalf("flag wins %+v %v", fromFlag.Census, err)
+	}
+	forcedOff, err := ParseOperator([]string{"--census=false"}, func(k string) (string, bool) {
+		if k == "SURFACE_CENSUS" {
+			return "1", true
+		}
+		return "", false
+	})
+	if err != nil || forcedOff.Census {
+		t.Fatalf("flag off %+v %v", forcedOff.Census, err)
+	}
+}
+
 func TestPunchFlag(t *testing.T) {
 	def, err := ParseOperator(nil, nil)
 	if err != nil {

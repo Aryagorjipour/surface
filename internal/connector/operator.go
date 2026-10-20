@@ -29,6 +29,7 @@ type Operator struct {
 	Punch           string
 	PunchSet        bool
 	Mailbox         time.Duration
+	Census          bool
 	Ready           bool
 }
 
@@ -65,6 +66,8 @@ func ConnectorHelp() string {
         punch listen address (default 127.0.0.1:8081)
   --mailbox duration
         mailbox TTL (default unset)
+  --census
+        operator peer and pending counts (default off)
   --ready
         probe http://127.0.0.1:8080/health and exit
   --config path
@@ -90,6 +93,7 @@ var connectorFileKeys = map[string]struct{}{
 	"OTEL_EXPORTER_OTLP_ENDPOINT":  {},
 	"SURFACE_PUNCH_ADDR":           {},
 	"SURFACE_MAILBOX":              {},
+	"SURFACE_CENSUS":               {},
 	"SURFACE_CONFIG":               {},
 }
 
@@ -132,6 +136,7 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	trace := fs.String("trace-endpoint", "", "trace endpoint")
 	punch := fs.String("punch", "127.0.0.1:8081", "punch listen address")
 	mailboxFlag := fs.String("mailbox", "", "mailbox TTL")
+	censusFlag := fs.Bool("census", false, "operator census")
 	ready := fs.Bool("ready", false, "probe health")
 	configPath := fs.String("config", "", "config file")
 	if err := fs.Parse(args); err != nil {
@@ -205,6 +210,10 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 	if err != nil {
 		return Operator{}, err
 	}
+	census, err := resolveCensus(set["census"], *censusFlag, lookup, file)
+	if err != nil {
+		return Operator{}, err
+	}
 
 	return Operator{
 		Listen:          listenAddr,
@@ -221,7 +230,32 @@ func ParseOperator(args []string, lookup func(string) (string, bool)) (Operator,
 		Punch:           punchAddr,
 		PunchSet:        punchSet,
 		Mailbox:         mailboxTTL,
+		Census:          census,
 	}, nil
+}
+
+func resolveCensus(flagSet, flagVal bool, lookup func(string) (string, bool), file map[string]string) (bool, error) {
+	if flagSet {
+		return flagVal, nil
+	}
+	if raw, ok := lookup("SURFACE_CENSUS"); ok {
+		return parseCensus(raw)
+	}
+	if raw, ok := file["SURFACE_CENSUS"]; ok {
+		return parseCensus(raw)
+	}
+	return false, nil
+}
+
+func parseCensus(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "0", "false", "f":
+		return false, nil
+	case "1", "true", "t":
+		return true, nil
+	default:
+		return false, fmt.Errorf("SURFACE_CENSUS is not a boolean")
+	}
 }
 
 func mailboxDuration(flagSet bool, flagVal string, lookup func(string) (string, bool), file map[string]string) (time.Duration, error) {
