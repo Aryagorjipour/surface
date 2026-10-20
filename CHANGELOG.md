@@ -4,6 +4,7 @@
 
 ### Added
 
+- A tag `vMAJOR.MINOR.PATCH` publishes `connector` and `surface` binaries, `SHA256SUMS`, and a signed SLSA provenance attestation.
 - A direct chat uses a fresh key for each message. The current key cannot read earlier messages.
 - With `SURFACE_MAILBOX` set to a positive duration, Surface can leave one short encrypted line for a peer who is not in a chat. The connector stores the ciphertext until that peer collects it, or until the duration ends.
 - One Surface can keep several direct chats at once. `--max-chats` / `SURFACE_MAX_CHATS` sets the ceiling (default 4). `/focus` and `/chats` switch among live conversations without closing inactive sockets.
@@ -14,6 +15,7 @@
 
 ### Fixed
 
+- Builds use Go 1.27.2 and golang.org/x/net v0.60.0.
 - The local stack allows 240 requests per source per minute, so two Surfaces on one machine can poll, connect, and accept. A refused call is reported as `too many requests`.
 - A file-backed connector store keeps one SQLite connection open, so two peers can register together.
 - Connector spans record the route endpoint and the HTTP status.
