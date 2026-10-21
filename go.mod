@@ -1,6 +1,6 @@
 module github.com/Aryagorjipour/surface
 
-go 1.27.2
+go 1.27
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
