@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Aryagorjipour/surface/internal/session"
 )
 
 type lockedBuffer struct {
@@ -433,6 +437,11 @@ func TestAcceptSkippedAtCapacity(t *testing.T) {
 }
 
 func TestAcceptWhileFocusedHitsConnector(t *testing.T) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := session.PublicText(priv.PublicKey())
 	var accepts int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/accept") {
@@ -440,12 +449,21 @@ func TestAcceptWhileFocusedHitsConnector(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"accepted"}`))
 	}))
 	defer srv.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	a := &app{base: srv.URL, token: "dev", ctx: ctx, cancel: cancel, maxChats: 4}
+	a := &app{
+		base:     srv.URL,
+		myKey:    "focused",
+		token:    "dev",
+		ctx:      ctx,
+		cancel:   cancel,
+		maxChats: 4,
+		identity: priv,
+		fromKey:  map[string]savedCaller{"req-b": {name: "alice", identity: pub}},
+	}
 	a.initRegistry()
 	_ = attachPipe(t, a.registry, "req-a", "alice")
 	_ = a.handleLine("accept req-b")
@@ -510,7 +528,7 @@ func TestAcceptReportsRateLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 	a := &app{base: srv.URL, token: "dev", ctx: context.Background()}
-	if _, err := a.postAction("req-1", "accept"); err == nil || err.Error() != "too many requests" {
+	if err := a.postAction("req-1", "accept"); err == nil || err.Error() != "too many requests" {
 		t.Fatalf("accept: %v", err)
 	}
 }

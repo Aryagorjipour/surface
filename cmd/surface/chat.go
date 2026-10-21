@@ -31,16 +31,16 @@ type Gate struct {
 type invite struct {
 	caller string
 	target string
-	proof  []byte
+	key    session.HandshakeKey
 }
 
-func (g *Gate) remember(requestID, callerKey, targetKey string, proof []byte) {
+func (g *Gate) remember(requestID, callerKey, targetKey string, key session.HandshakeKey) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.invites == nil {
 		g.invites = make(map[string]invite)
 	}
-	g.invites[requestID] = invite{caller: callerKey, target: targetKey, proof: append([]byte(nil), proof...)}
+	g.invites[requestID] = invite{caller: callerKey, target: targetKey, key: key}
 }
 
 func (g *Gate) session(requestID string) *session.Session {
@@ -60,8 +60,8 @@ func (g *Gate) idOf(sess *session.Session) string {
 	return ""
 }
 
-func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte) (*session.Session, error) {
-	msg, st, err := session.Offer(requestID, callerKey, targetKey, proof)
+func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, key session.HandshakeKey) (*session.Session, error) {
+	msg, st, err := session.Offer(requestID, callerKey, targetKey, key)
 	if err != nil {
 		return nil, err
 	}
@@ -75,15 +75,15 @@ func (g *Gate) dialAdmitted(ctx context.Context, conn byteConn, requestID, calle
 	return session.FinishOffer(reply, st)
 }
 
-func (g *Gate) acceptAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+func (g *Gate) acceptAdmitted(ctx context.Context, conn byteConn, requestID, callerKey, targetKey string, key session.HandshakeKey, ready func(*session.Session)) error {
 	_, msg, err := conn.Read(ctx)
 	if err != nil {
 		return err
 	}
-	return g.finishAdmit(ctx, conn, msg, requestID, callerKey, targetKey, proof, ready)
+	return g.finishAdmit(ctx, conn, msg, requestID, callerKey, targetKey, key, ready)
 }
 
-func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, requestID, callerKey, targetKey string, proof []byte, ready func(*session.Session)) error {
+func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, requestID, callerKey, targetKey string, key session.HandshakeKey, ready func(*session.Session)) error {
 	_, span := startAcceptSpan(ctx)
 	status := "refused"
 	defer endAcceptSpan(&span, &status)
@@ -95,7 +95,7 @@ func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, reque
 		_ = conn.Close(websocket.StatusPolicyViolation, "")
 		return fmt.Errorf("refused")
 	}
-	reply, sess, err := session.AcceptOffer(msg, requestID, callerKey, targetKey, proof, spent)
+	reply, sess, err := session.AcceptOffer(msg, requestID, callerKey, targetKey, key, spent)
 	if err != nil {
 		_ = conn.Close(websocket.StatusPolicyViolation, "")
 		return err
@@ -137,7 +137,7 @@ func (g *Gate) take(ctx context.Context, conn byteConn, now, deadline time.Time,
 		if !ok || inv.caller != caller {
 			return refuseAccept(ctx, conn)
 		}
-		if err := g.finishAdmit(ctx, conn, msg, id, caller, inv.target, inv.proof, ready); err != nil {
+		if err := g.finishAdmit(ctx, conn, msg, id, caller, inv.target, inv.key, ready); err != nil {
 			return nil, err
 		}
 		return g.session(id), nil

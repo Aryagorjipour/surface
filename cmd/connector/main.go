@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -32,9 +35,7 @@ func installTracer(ctx context.Context, logger *slog.Logger, endpoint string) fu
 
 func main() {
 	logger := shared.NewLogger("connector")
-	if err := run(os.Args[1:], os.LookupEnv, logger, func(srv *http.Server) error {
-		return srv.ListenAndServe()
-	}); err != nil {
+	if err := run(os.Args[1:], os.LookupEnv, logger, nil); err != nil {
 		logger.Error("refused startup", "err", err)
 		os.Exit(1)
 	}
@@ -52,7 +53,7 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		return err
 	}
 	if op.Ready {
-		return probeReady()
+		return probeReady(op.TLS.Cert)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,20 +86,14 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	if op.CacheSet {
 		cacheAddr = op.CacheAddr
 	}
-	var cache *connector.RedisCache
-	if cacheAddr != "" && cacheAddr != "redis:6379" {
-		cache = connector.NewRedis(cacheAddr, secrets.RedisPassword)
-		pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
-		err := cache.Ping(pingCtx)
-		pingCancel()
-		if err != nil {
-			logger.Warn("redis unavailable, continuing without cache", "err", err)
-			cache = nil
-		} else {
-			logger.Info("redis connected")
-		}
-	} else {
+	cache, err := connector.OpenCache(ctx, cacheAddr, secrets.RedisPassword, secrets.EncryptionKey)
+	if err != nil {
+		return err
+	}
+	if cache == nil {
 		logger.Info("redis disabled")
+	} else {
+		logger.Info("redis connected")
 	}
 
 	h := connector.NewHandlers(store, cache, logger)
@@ -146,9 +141,13 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		IdleTimeout:  60 * time.Second,
 	}
 
+	serve := listen
+	if serve == nil {
+		serve = op.TLS.Serve
+	}
 	go func() {
 		logger.Info("connector listening", "addr", srv.Addr)
-		if err := listen(srv); err != nil && err != http.ErrServerClosed {
+		if err := serve(srv); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "err", err)
 			os.Exit(1)
 		}
@@ -182,10 +181,37 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	return nil
 }
 
-// probeReady is a client. It does not load secrets and does not listen.
-func probeReady() error {
+func probeReady(certFile string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:8080/health")
+	url := "http://127.0.0.1:8080/health"
+	if strings.TrimSpace(certFile) != "" {
+		url = "https://127.0.0.1:8080/health"
+		want, err := os.ReadFile(certFile)
+		if err != nil {
+			return err
+		}
+		block, _ := pem.Decode(want)
+		if block == nil {
+			return fmt.Errorf("not ready")
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return err
+		}
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: true,
+				VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+					if len(raw) == 0 || !bytes.Equal(raw[0], leaf.Raw) {
+						return fmt.Errorf("not ready")
+					}
+					return nil
+				},
+			},
+		}
+	}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}

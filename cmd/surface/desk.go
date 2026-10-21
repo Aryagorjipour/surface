@@ -82,22 +82,30 @@ func (a *app) acceptRequest(id string) error {
 		a.println("at capacity")
 		return ErrAtCapacity
 	}
-	proofText, err := a.postAction(id, "accept")
+	if err := a.ensureIdentity(); err != nil {
+		a.println("accept error:", err)
+		return err
+	}
+	pub, err := session.ParsePublic(a.peerPublic(id))
 	if err != nil {
 		a.println("accept error:", err)
 		return err
 	}
-	raw, err := session.DecodeProof(proofText)
+	if err := a.postAction(id, "accept"); err != nil {
+		a.println("accept error:", err)
+		return err
+	}
+	key, err := session.DeriveHandshakeKey(a.identity, pub, id)
 	if err != nil {
 		a.println("accept error:", err)
 		return err
 	}
 	from := a.callerFor(id)
-	a.gate.remember(id, from, a.myKey, raw)
+	a.gate.remember(id, from, a.myKey, key)
 	a.say("accepted — waiting for peer to dial")
 	a.note(note{kind: noteClear, id: id})
 	go func() {
-		_ = a.attempt(false, "", id, from, a.myKey, raw)
+		_ = a.attempt(false, "", id, from, a.myKey, key)
 	}()
 	return nil
 }
@@ -107,7 +115,7 @@ func (a *app) rejectRequest(id string) error {
 		a.println("usage: reject <request-id>")
 		return errors.New("usage")
 	}
-	if _, err := a.postAction(id, "reject"); err != nil {
+	if err := a.postAction(id, "reject"); err != nil {
 		a.println("reject error:", err)
 		return err
 	}

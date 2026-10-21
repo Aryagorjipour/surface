@@ -13,9 +13,10 @@ import (
 
 type RedisCache struct {
 	client *redis.Client
+	encKey []byte
 }
 
-func NewRedis(addr, password string) *RedisCache {
+func NewRedis(addr, password string, encKey []byte) *RedisCache {
 	if addr == "" {
 		return nil
 	}
@@ -25,7 +26,32 @@ func NewRedis(addr, password string) *RedisCache {
 			Password: password,
 			DB:       0,
 		}),
+		encKey: append([]byte(nil), encKey...),
 	}
+}
+
+func ClassifyRedis(addr string) bool {
+	return addr != "" && addr != "redis:6379"
+}
+
+func OpenCache(ctx context.Context, addr, password string, encKey []byte) (*RedisCache, error) {
+	if !ClassifyRedis(addr) {
+		return nil, nil
+	}
+	if password == "" {
+		return nil, fmt.Errorf("redis password required")
+	}
+	if len(encKey) != 32 {
+		return nil, fmt.Errorf("encryption key must be 32 bytes")
+	}
+	cache := NewRedis(addr, password, encKey)
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := cache.Ping(pingCtx); err != nil {
+		_ = cache.Close()
+		return nil, err
+	}
+	return cache, nil
 }
 
 func (r *RedisCache) Ping(ctx context.Context) error {
@@ -47,6 +73,7 @@ type cachedPeer struct {
 	Key      string `json:"key"`
 	Address  string `json:"address"`
 	State    string `json:"state"`
+	Identity string `json:"identity"`
 	LastSeen int64  `json:"last_seen"`
 }
 
@@ -55,7 +82,7 @@ func (r *RedisCache) SetPeer(ctx context.Context, key string, p peerResponse, la
 	if r == nil {
 		return nil
 	}
-	b, err := json.Marshal(cachedPeer{Key: p.Key, Address: p.Address, State: p.State, LastSeen: lastSeen})
+	b, err := json.Marshal(cachedPeer{Key: p.Key, Address: p.Address, State: p.State, Identity: p.Identity, LastSeen: lastSeen})
 	if err != nil {
 		return err
 	}
@@ -90,7 +117,8 @@ type storedRequest struct {
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
-// Pending requests
+var errSealed = errors.New("sealed request")
+
 func (r *RedisCache) SetRequest(ctx context.Context, cr *ConnectRequest, ttl time.Duration) error {
 	if r == nil {
 		return nil
@@ -99,8 +127,18 @@ func (r *RedisCache) SetRequest(ctx context.Context, cr *ConnectRequest, ttl tim
 	if err != nil {
 		return err
 	}
+	ct, nonce, err := encrypt(r.encKey, string(b))
+	if err != nil {
+		return err
+	}
+	if len(nonce) != 12 {
+		return errSealed
+	}
+	blob := make([]byte, 0, len(nonce)+len(ct))
+	blob = append(blob, nonce...)
+	blob = append(blob, ct...)
 	pipe := r.client.Pipeline()
-	pipe.Set(ctx, "req:"+cr.ID, b, ttl)
+	pipe.Set(ctx, "req:"+cr.ID, blob, ttl)
 	pipe.SAdd(ctx, "pending:"+cr.ToKey, cr.ID)
 	pipe.Expire(ctx, "pending:"+cr.ToKey, ttl)
 	_, err = pipe.Exec(ctx)
@@ -115,8 +153,12 @@ func (r *RedisCache) GetRequest(ctx context.Context, id string) (*ConnectRequest
 	if err != nil {
 		return nil, err
 	}
+	plain, err := openRequest(r.encKey, b)
+	if err != nil {
+		return nil, err
+	}
 	var stored storedRequest
-	if err := json.Unmarshal(b, &stored); err != nil {
+	if err := json.Unmarshal([]byte(plain), &stored); err != nil {
 		return nil, err
 	}
 	cr := stored.ConnectRequest
@@ -124,8 +166,17 @@ func (r *RedisCache) GetRequest(ctx context.Context, id string) (*ConnectRequest
 	return &cr, nil
 }
 
-// fetchStored reads every pending set. A body that does not parse is counted
-// and left in place. Any other error aborts the fill.
+func openRequest(key, blob []byte) (string, error) {
+	if len(blob) < 12 {
+		return "", errSealed
+	}
+	plain, err := decrypt(key, blob[12:], blob[:12])
+	if err != nil {
+		return "", errSealed
+	}
+	return plain, nil
+}
+
 func (r *RedisCache) fetchStored(ctx context.Context) ([]storedRequest, int, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
@@ -175,6 +226,9 @@ func (r *RedisCache) fetchStored(ctx context.Context) ([]storedRequest, int, err
 }
 
 func badRequestBody(err error) bool {
+	if errors.Is(err, errSealed) {
+		return true
+	}
 	var syntax *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
 	return errors.As(err, &syntax) || errors.As(err, &typeErr)

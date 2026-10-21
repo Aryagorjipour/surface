@@ -2,27 +2,26 @@ package session
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"testing"
 	"time"
 )
 
-func pair(t *testing.T) (dialer, listener *Session, proof []byte) {
+func pair(t *testing.T) (dialer, listener *Session, key HandshakeKey) {
 	t.Helper()
-	raw, text, err := NewProof()
+	key, err := NewHandshakeKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != ProofBytes || base64.StdEncoding.EncodeToString(raw) != text {
-		t.Fatalf("proof %d %q", len(raw), text)
-	}
-	offer, st, err := Offer("req-1", "caller", "target", raw)
+	offer, st, err := Offer("req-1", "caller", "target", key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply, listener, err := AcceptOffer(offer, "req-1", "caller", "target", raw, false)
+	reply, listener, err := AcceptOffer(offer, "req-1", "caller", "target", key, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,23 +29,21 @@ func pair(t *testing.T) (dialer, listener *Session, proof []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return dialer, listener, raw
+	return dialer, listener, key
 }
 
 func TestHandshakeRejectsBadProof(t *testing.T) {
-	raw, text, err := NewProof()
+	raw, err := NewHandshakeKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) != ProofBytes || base64.StdEncoding.EncodeToString(raw) != text {
-		t.Fatalf("proof %d", len(raw))
-	}
+	text := base64.StdEncoding.EncodeToString(raw[:])
 	offer, st, err := Offer("req-1", "caller", "target", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(offer, raw) || bytes.Contains(offer, []byte(text)) {
-		t.Fatal("offer carries the proof")
+	if bytes.Contains(offer, raw[:]) || bytes.Contains(offer, []byte(text)) {
+		t.Fatal("offer carries the key")
 	}
 	reply, sess, err := AcceptOffer(offer, "req-1", "caller", "target", raw, false)
 	if err != nil || sess == nil {
@@ -58,24 +55,24 @@ func TestHandshakeRejectsBadProof(t *testing.T) {
 
 	cases := []struct {
 		name  string
-		proof []byte
+		proof HandshakeKey
 		id    string
 		key   string
 		spent bool
 	}{
-		{name: "first", proof: flip(raw, 0), id: "req-1", key: "caller"},
-		{name: "last", proof: flip(raw, len(raw)-1), id: "req-1", key: "caller"},
-		{name: "missing", proof: nil, id: "req-1", key: "caller"},
+		{name: "first", proof: flipKey(raw, 0), id: "req-1", key: "caller"},
+		{name: "last", proof: flipKey(raw, len(raw)-1), id: "req-1", key: "caller"},
+		{name: "missing", id: "req-1", key: "caller"},
 		{name: "id", proof: raw, id: "other", key: "caller"},
 		{name: "caller", proof: raw, id: "req-1", key: "other"},
 		{name: "spent", proof: raw, id: "req-1", key: "caller", spent: true},
 	}
 	for _, tc := range cases {
-		sum := proofMAC(tc.proof, macInput(typeOffer, tc.id, tc.key, offerEph(t, offer), nil))
+		sum := proofMAC(tc.proof[:], macInput(typeOffer, tc.id, tc.key, offerEph(t, offer), nil))
 		if len(sum) != sha256.Size {
 			t.Fatalf("%s mac %d", tc.name, len(sum))
 		}
-		manual := hmac.New(sha256.New, tc.proof)
+		manual := hmac.New(sha256.New, tc.proof[:])
 		_, _ = manual.Write(macInput(typeOffer, tc.id, tc.key, offerEph(t, offer), nil))
 		if !hmac.Equal(sum, manual.Sum(nil)) {
 			t.Fatalf("%s mac ignored part of the proof", tc.name)
@@ -84,6 +81,53 @@ func TestHandshakeRejectsBadProof(t *testing.T) {
 		if err == nil || gotSess != nil || gotReply != nil {
 			t.Fatalf("%s accepted", tc.name)
 		}
+	}
+}
+
+func TestRawFrameDoesNotContainPlaintext(t *testing.T) {
+	alice, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "req-role"
+	ab, err := DeriveHandshakeKey(alice, bob.PublicKey(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ba, err := DeriveHandshakeKey(bob, alice.PublicKey(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ab != ba {
+		t.Fatal("role order changed the handshake key")
+	}
+	offer, st, err := Offer(id, "alice", "bob", ab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, listener, err := AcceptOffer(offer, id, "alice", "bob", ba, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, err := FinishOffer(reply, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const line = "surface-plain-line"
+	frame, err := Seal(dialer, line, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(frame, []byte(line)) {
+		t.Fatal("frame contains the line")
+	}
+	got, display, err := Open(listener, frame)
+	if err != nil || !display || got != line {
+		t.Fatalf("open %q %v %v", got, display, err)
 	}
 }
 
@@ -373,8 +417,7 @@ func offerEph(t *testing.T, offer []byte) []byte {
 	return eph
 }
 
-func flip(in []byte, i int) []byte {
-	out := append([]byte(nil), in...)
-	out[i] ^= 0xff
-	return out
+func flipKey(in HandshakeKey, i int) HandshakeKey {
+	in[i] ^= 0xff
+	return in
 }

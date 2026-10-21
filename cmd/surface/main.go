@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +39,11 @@ type connectResp struct {
 	Status    string `json:"status"`
 }
 
+type savedCaller struct {
+	name     string
+	identity string
+}
+
 type app struct {
 	base         string
 	myKey        string
@@ -48,10 +55,14 @@ type app struct {
 	logger       *slog.Logger
 	ctx          context.Context
 	cancel       context.CancelFunc
+	identity     *ecdh.PrivateKey
+	direct       shared.CertPair
+	directSecure bool
+	directRoots  *x509.CertPool
 
 	mu        sync.Mutex
 	presence  string
-	fromKey   map[string]string
+	fromKey   map[string]savedCaller
 	gate      Gate
 	registry  *Registry
 	maxChats  int
@@ -99,6 +110,14 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 	if err != nil {
 		return err
 	}
+	identity, err := loadIdentity(lookup, cfg.rest[1])
+	if err != nil {
+		return err
+	}
+	roots, err := loadDirectRoots(cfg.directCA)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	endpoint, _ := lookup("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -124,7 +143,11 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		ctx:          ctx,
 		cancel:       cancel,
 		presence:     "available",
-		fromKey:      map[string]string{},
+		identity:     identity,
+		direct:       cfg.direct,
+		directSecure: cfg.direct.Cert != "",
+		directRoots:  roots,
+		fromKey:      map[string]savedCaller{},
 		punchAddr:    cfg.punch,
 		relayAddr:    cfg.relay,
 		maxChats:     cfg.maxChats,
@@ -350,8 +373,14 @@ func (a *app) register(state string) error {
 	a.mu.Lock()
 	a.presence = state
 	a.mu.Unlock()
+	if err := a.ensureIdentity(); err != nil {
+		return err
+	}
 	body, _ := json.Marshal(map[string]string{
-		"key": a.myKey, "address": a.listenAddr.String(), "state": state,
+		"key":      a.myKey,
+		"address":  a.listenAddr.String(),
+		"state":    state,
+		"identity": session.PublicText(a.identity.PublicKey()),
 	})
 	resp, err := a.do(http.MethodPost, a.base+"/peers", body)
 	if err != nil {
@@ -540,12 +569,13 @@ func (a *app) pollPending() {
 			for _, r := range reqs {
 				id, _ := r["request_id"].(string)
 				from, _ := r["from_key"].(string)
+				ident, _ := r["from_identity"].(string)
 				if id == "" || seen[id] {
 					continue
 				}
 				seen[id] = true
 				a.mu.Lock()
-				a.fromKey[id] = from
+				a.fromKey[id] = savedCaller{name: from, identity: ident}
 				a.mu.Unlock()
 				if a.deskCh != nil {
 					a.note(note{kind: noteInvite, key: from, id: id})
@@ -557,26 +587,40 @@ func (a *app) pollPending() {
 	}
 }
 
-func (a *app) postAction(id, action string) (string, error) {
+func (a *app) postAction(id, action string) error {
 	resp, err := a.do(http.MethodPost, a.base+"/requests/"+id+"/"+action, nil)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer a.drain(resp.Body)
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return "", errors.New("too many requests")
+		return errors.New("too many requests")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 	var body struct {
 		Status string `json:"status"`
-		Proof  string `json:"admission_proof"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil && action == "accept" {
-		return "", err
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return err
 	}
-	return body.Proof, nil
+	if action == "accept" && body.Status != "accepted" {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (a *app) ensureIdentity() error {
+	if a == nil || a.identity != nil {
+		return nil
+	}
+	key, err := loadIdentity(os.LookupEnv, a.myKey)
+	if err != nil {
+		return err
+	}
+	a.identity = key
+	return nil
 }
 
 func (a *app) doConnect(target string) error {
@@ -630,8 +674,8 @@ func (a *app) doConnect(target string) error {
 			continue
 		}
 		var status struct {
-			Status string `json:"status"`
-			Proof  string `json:"admission_proof"`
+			Status     string `json:"status"`
+			ToIdentity string `json:"to_identity"`
 		}
 		err = json.NewDecoder(resp.Body).Decode(&status)
 		a.drain(resp.Body)
@@ -642,12 +686,19 @@ func (a *app) doConnect(target string) error {
 			continue
 		}
 		if status.Status == "accepted" {
-			raw, err := session.DecodeProof(status.Proof)
+			pub, err := session.ParsePublic(status.ToIdentity)
+			if err != nil {
+				return err
+			}
+			if err := a.ensureIdentity(); err != nil {
+				return err
+			}
+			key, err := session.DeriveHandshakeKey(a.identity, pub, cr.RequestID)
 			if err != nil {
 				return err
 			}
 			a.say("accepted — dialing", p.Address)
-			return a.attempt(true, p.Address, cr.RequestID, a.myKey, target, raw)
+			return a.attempt(true, p.Address, cr.RequestID, a.myKey, target, key)
 		}
 		if status.Status == "rejected" {
 			return fmt.Errorf("rejected")
@@ -672,7 +723,7 @@ func (a *app) serveWS() {
 			a.logger.Error("ws shutdown")
 		}
 	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed && a.logger != nil {
+	if err := a.direct.Serve(srv); err != nil && err != http.ErrServerClosed && a.logger != nil {
 		a.logger.Error("ws listen failed")
 	}
 }
@@ -711,27 +762,42 @@ func (a *app) say(args ...any) {
 }
 
 func (a *app) callerFor(id string) string {
+	return a.callerSnap(id).name
+}
+
+func (a *app) peerPublic(id string) string {
+	return a.callerSnap(id).identity
+}
+
+func (a *app) callerSnap(id string) savedCaller {
 	a.mu.Lock()
-	from := a.fromKey[id]
+	saved := a.fromKey[id]
 	a.mu.Unlock()
-	if from != "" {
-		return from
+	if saved.name != "" && saved.identity != "" {
+		return saved
 	}
 	resp, err := a.do(http.MethodGet, a.base+"/requests/"+id, nil)
 	if err != nil {
-		return ""
+		return saved
 	}
 	defer a.drain(resp.Body)
 	var body struct {
-		From string `json:"from_key"`
+		From     string `json:"from_key"`
+		Identity string `json:"from_identity"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return ""
+		return saved
+	}
+	if saved.name == "" {
+		saved.name = body.From
+	}
+	if saved.identity == "" {
+		saved.identity = body.Identity
 	}
 	a.mu.Lock()
-	a.fromKey[id] = body.From
+	a.fromKey[id] = saved
 	a.mu.Unlock()
-	return body.From
+	return saved
 }
 
 func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hostport.Addr, id ConvID, peer string) bool {
@@ -743,6 +809,8 @@ func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hos
 		Conn:   c,
 		Dialer: dialer,
 		Addr:   addr,
+		Secure: a.directSecure,
+		Roots:  a.directRoots,
 	})
 	if err != nil {
 		return false

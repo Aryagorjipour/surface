@@ -1,10 +1,11 @@
 services:
   cache:
     image: redis:7-alpine
+    command: redis-server --requirepass dev-redis
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "dev-redis", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -35,7 +36,7 @@ services:
     environment:
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: root
-    command: vault kv put secret/surface/connector turso_url=file:/app/data/surface.db turso_token=dev encryption_key=ZGV2LXN1cmZhY2Uta2V5LWRldi1zdXJmYWNlLWtleSE= connector_token=dev redis_addr=cache:6379
+    command: vault kv put secret/surface/connector turso_url=file:/app/data/surface.db turso_token=dev encryption_key=ZGV2LXN1cmZhY2Uta2V5LWRldi1zdXJmYWNlLWtleSE= connector_token=dev redis_addr=cache:6379 redis_password=dev-redis
 
   connector:
     build:

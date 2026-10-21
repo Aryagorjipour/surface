@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"sync"
 	"time"
@@ -42,6 +43,8 @@ type Conversation struct {
 	addr   hostport.Addr
 	window time.Duration
 	reg    *Registry
+	secure bool
+	roots  *x509.CertPool
 
 	stateMu  sync.Mutex
 	sess     *session.Session
@@ -60,6 +63,8 @@ type AttachReq struct {
 	Conn   byteConn
 	Dialer bool
 	Addr   hostport.Addr
+	Secure bool
+	Roots  *x509.CertPool
 }
 
 func (c *Conversation) ID() ConvID   { return c.id }
@@ -446,7 +451,7 @@ func (c *Conversation) retryDial() {
 			}
 			return
 		}
-		conn, err := dialWebSocket(c.ctx, addr)
+		conn, err := dialPeer(c.ctx, addr, c.secure, c.roots)
 		if err != nil {
 			continue
 		}

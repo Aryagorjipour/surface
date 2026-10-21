@@ -49,7 +49,7 @@ func TestRelayFrames(t *testing.T) {
 		t.Fatal("length 0")
 	}
 
-	proofRaw, _, err := session.NewProof()
+	proofRaw, err := session.NewHandshakeKey()
 	if err != nil {
 		t.Fatal(err)
 	}

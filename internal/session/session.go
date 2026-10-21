@@ -18,9 +18,6 @@ import (
 )
 
 const (
-	// ProofBytes is the raw admission proof length.
-	ProofBytes = 32
-
 	typeOffer   = 0x01
 	typeReply   = 0x02
 	typeChat    = 0x03
@@ -41,29 +38,59 @@ var (
 	errFinished = errors.New("finished")
 )
 
-// NewProof returns 32 random bytes and their standard base64 text.
-func NewProof() (raw []byte, text string, err error) {
-	raw = make([]byte, ProofBytes)
-	if _, err = rand.Read(raw); err != nil {
-		return nil, "", err
+type HandshakeKey [32]byte
+
+func NewHandshakeKey() (HandshakeKey, error) {
+	var key HandshakeKey
+	if _, err := rand.Read(key[:]); err != nil {
+		return HandshakeKey{}, err
 	}
-	return raw, base64.StdEncoding.EncodeToString(raw), nil
+	return key, nil
 }
 
-// DecodeProof decodes a standard-base64 admission proof.
-func DecodeProof(text string) ([]byte, error) {
+func DeriveHandshakeKey(mine *ecdh.PrivateKey, theirs *ecdh.PublicKey, requestID string) (HandshakeKey, error) {
+	if mine == nil || theirs == nil {
+		return HandshakeKey{}, errRefused
+	}
+	shared, err := mine.ECDH(theirs)
+	if err != nil {
+		return HandshakeKey{}, err
+	}
+	defer clear(shared)
+	raw, err := hkdf.Key(sha256.New, shared, []byte(requestID), "surface-admit-v1", len(HandshakeKey{}))
+	if err != nil {
+		return HandshakeKey{}, err
+	}
+	var key HandshakeKey
+	copy(key[:], raw)
+	clear(raw)
+	return key, nil
+}
+
+func PublicText(pub *ecdh.PublicKey) string {
+	if pub == nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(pub.Bytes())
+}
+
+func ParsePublic(text string) (*ecdh.PublicKey, error) {
 	raw, err := base64.StdEncoding.DecodeString(text)
-	if err != nil || len(raw) != ProofBytes {
+	if err != nil || len(raw) != 32 {
 		return nil, errRefused
 	}
-	return raw, nil
+	pub, err := ecdh.X25519().NewPublicKey(raw)
+	if err != nil {
+		return nil, errRefused
+	}
+	return pub, nil
 }
 
 type offerState struct {
 	requestID string
 	callerKey string
 	targetKey string
-	proof     []byte
+	key       HandshakeKey
 	priv      *ecdh.PrivateKey
 	eph       []byte
 }
@@ -100,30 +127,28 @@ type Session struct {
 	notice   []byte
 }
 
-// Offer builds a type 0x01 handshake. The proof is the HMAC key and is not written.
-func Offer(requestID, callerKey, targetKey string, proof []byte) ([]byte, *offerState, error) {
+func Offer(requestID, callerKey, targetKey string, key HandshakeKey) ([]byte, *offerState, error) {
 	priv, eph, err := newEph()
 	if err != nil {
 		return nil, nil, err
 	}
-	msg := handshake(typeOffer, requestID, callerKey, eph, nil, proof)
+	msg := handshake(typeOffer, requestID, callerKey, eph, nil, key)
 	st := &offerState{
 		requestID: requestID,
 		callerKey: callerKey,
 		targetKey: targetKey,
-		proof:     append([]byte(nil), proof...),
+		key:       key,
 		priv:      priv,
 		eph:       eph,
 	}
 	return msg, st, nil
 }
 
-// AcceptOffer checks a type 0x01 message. alreadyAdmitted refuses without a session.
-func AcceptOffer(msg []byte, requestID, callerKey, targetKey string, proof []byte, alreadyAdmitted bool) ([]byte, *Session, error) {
+func AcceptOffer(msg []byte, requestID, callerKey, targetKey string, key HandshakeKey, alreadyAdmitted bool) ([]byte, *Session, error) {
 	eph, mac, err := splitOffer(msg)
 	input := macInput(typeOffer, requestID, callerKey, eph, nil)
-	sum := proofMAC(proof, input)
-	if err != nil || len(proof) != ProofBytes || !hmac.Equal(sum, mac) {
+	sum := proofMAC(key[:], input)
+	if err != nil || !hmac.Equal(sum, mac) {
 		return nil, nil, errRefused
 	}
 	if alreadyAdmitted {
@@ -137,11 +162,11 @@ func AcceptOffer(msg []byte, requestID, callerKey, targetKey string, proof []byt
 	if err != nil {
 		return nil, nil, errRefused
 	}
-	sess, err := newSession(dirListener, requestID, callerKey, targetKey, shared, proof)
+	sess, err := newSession(dirListener, requestID, callerKey, targetKey, shared, key)
 	if err != nil {
 		return nil, nil, err
 	}
-	reply := handshake(typeReply, requestID, callerKey, eph, mine, proof)
+	reply := handshake(typeReply, requestID, callerKey, eph, mine, key)
 	return reply, sess, nil
 }
 
@@ -152,18 +177,17 @@ func FinishOffer(reply []byte, state *offerState) (*Session, error) {
 	}
 	mine, mac, err := splitReply(reply)
 	input := macInput(typeReply, state.requestID, state.callerKey, state.eph, mine)
-	sum := proofMAC(state.proof, input)
-	if err != nil || len(state.proof) != ProofBytes || !hmac.Equal(sum, mac) {
+	sum := proofMAC(state.key[:], input)
+	if err != nil || !hmac.Equal(sum, mac) {
 		return nil, errRefused
 	}
 	shared, err := sharedSecret(state.priv, mine)
 	if err != nil {
 		return nil, errRefused
 	}
-	return newSession(dirDialer, state.requestID, state.callerKey, state.targetKey, shared, state.proof)
+	return newSession(dirDialer, state.requestID, state.callerKey, state.targetKey, shared, state.key)
 }
 
-// Seal encrypts one chat line as type 0x03. ack 0 means no acknowledgement.
 func Seal(sess *Session, plaintext string, ack uint64) ([]byte, error) {
 	if sess == nil {
 		return nil, errRefused
@@ -423,22 +447,22 @@ func (s *Session) resumeMsg(typ byte) []byte {
 	return append(body, mac...)
 }
 
-func newSession(sendDir byte, requestID, callerKey, targetKey string, shared, proof []byte) (*Session, error) {
+func newSession(sendDir byte, requestID, callerKey, targetKey string, shared []byte, key HandshakeKey) (*Session, error) {
 	defer clear(shared)
 	sendLabel, recvLabel := "surface-chain-dialer-v1", "surface-chain-listener-v1"
 	if sendDir == dirListener {
 		sendLabel, recvLabel = recvLabel, sendLabel
 	}
-	send, err := derive(shared, proof, callerKey, targetKey, sendLabel)
+	send, err := derive(shared, key[:], callerKey, targetKey, sendLabel)
 	if err != nil {
 		return nil, err
 	}
-	recv, err := derive(shared, proof, callerKey, targetKey, recvLabel)
+	recv, err := derive(shared, key[:], callerKey, targetKey, recvLabel)
 	if err != nil {
 		clear(send)
 		return nil, err
 	}
-	resume, err := derive(shared, proof, callerKey, targetKey, "surface-resume-v1")
+	resume, err := derive(shared, key[:], callerKey, targetKey, "surface-resume-v1")
 	if err != nil {
 		clear(send)
 		clear(recv)
@@ -492,7 +516,7 @@ func sharedSecret(priv *ecdh.PrivateKey, raw []byte) ([]byte, error) {
 	return priv.ECDH(remote)
 }
 
-func handshake(typ byte, requestID, callerKey string, dialerEph, listenerEph, proof []byte) []byte {
+func handshake(typ byte, requestID, callerKey string, dialerEph, listenerEph []byte, key HandshakeKey) []byte {
 	var body []byte
 	if typ == typeOffer {
 		body = append([]byte{typ}, u16(requestID)...)
@@ -501,7 +525,7 @@ func handshake(typ byte, requestID, callerKey string, dialerEph, listenerEph, pr
 	} else {
 		body = append([]byte{typ}, listenerEph...)
 	}
-	mac := proofMAC(proof, macInput(typ, requestID, callerKey, dialerEph, listenerEph))
+	mac := proofMAC(key[:], macInput(typ, requestID, callerKey, dialerEph, listenerEph))
 	return append(body, mac...)
 }
 

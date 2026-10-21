@@ -104,17 +104,28 @@ func (s *Store) migrate(ctx context.Context) error {
 		address_enc BLOB NOT NULL,
 		address_nonce BLOB NOT NULL,
 		state TEXT NOT NULL,
-		last_seen INTEGER NOT NULL
+		last_seen INTEGER NOT NULL,
+		identity TEXT NOT NULL DEFAULT ''
 	);`
-	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE peers ADD COLUMN identity TEXT NOT NULL DEFAULT ''`)
+	if err != nil && !duplicateColumn(err) {
+		return err
+	}
+	return nil
+}
+
+func duplicateColumn(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column")
 }
 
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) UpsertPeer(ctx context.Context, key, address, state string) error {
+func (s *Store) UpsertPeer(ctx context.Context, key, address, state, identity string) error {
 	if key == "" || address == "" || state == "" {
 		return fmt.Errorf("key, address and state are required")
 	}
@@ -125,15 +136,16 @@ func (s *Store) UpsertPeer(ctx context.Context, key, address, state string) erro
 	}
 
 	const q = `
-	INSERT INTO peers (key, address_enc, address_nonce, state, last_seen)
-	VALUES (?, ?, ?, ?, ?)
+	INSERT INTO peers (key, address_enc, address_nonce, state, last_seen, identity)
+	VALUES (?, ?, ?, ?, ?, ?)
 	ON CONFLICT(key) DO UPDATE SET
 		address_enc = excluded.address_enc,
 		address_nonce = excluded.address_nonce,
 		state = excluded.state,
-		last_seen = excluded.last_seen;`
+		last_seen = excluded.last_seen,
+		identity = excluded.identity;`
 
-	_, err = s.db.ExecContext(ctx, q, key, ct, nonce, state, s.clock().Unix())
+	_, err = s.db.ExecContext(ctx, q, key, ct, nonce, state, s.clock().Unix(), identity)
 	return err
 }
 
@@ -185,30 +197,30 @@ func (s *Store) CountLivePeers(ctx context.Context, now time.Time, window time.D
 	return n, nil
 }
 
-func (s *Store) GetPeer(ctx context.Context, key string) (address, state string, lastSeen time.Time, err error) {
-	const q = `SELECT address_enc, address_nonce, state, last_seen FROM peers WHERE key = ?`
+func (s *Store) GetPeer(ctx context.Context, key string) (address, state, identity string, lastSeen time.Time, err error) {
+	const q = `SELECT address_enc, address_nonce, state, last_seen, identity FROM peers WHERE key = ?`
 	var ct, nonce []byte
 	var ts int64
-	err = s.db.QueryRowContext(ctx, q, key).Scan(&ct, &nonce, &state, &ts)
+	err = s.db.QueryRowContext(ctx, q, key).Scan(&ct, &nonce, &state, &ts, &identity)
 	if err == sql.ErrNoRows {
-		return "", "", time.Time{}, fmt.Errorf("peer not found")
+		return "", "", "", time.Time{}, fmt.Errorf("peer not found")
 	}
 	if err != nil {
-		return "", "", time.Time{}, err
+		return "", "", "", time.Time{}, err
 	}
 	if PeerStale(ts, s.clock(), s.silenceWindow()) {
 		if _, err := s.db.ExecContext(ctx, `DELETE FROM peers WHERE key = ?`, key); err != nil {
-			return "", "", time.Time{}, err
+			return "", "", "", time.Time{}, err
 		}
-		return "", "", time.Time{}, fmt.Errorf("peer not found")
+		return "", "", "", time.Time{}, fmt.Errorf("peer not found")
 	}
 
 	address, err = decrypt(s.encKey, ct, nonce)
 	if err != nil {
-		return "", "", time.Time{}, fmt.Errorf("decrypt: %w", err)
+		return "", "", "", time.Time{}, fmt.Errorf("decrypt: %w", err)
 	}
 	lastSeen = time.Unix(ts, 0)
-	return address, state, lastSeen, nil
+	return address, state, identity, lastSeen, nil
 }
 
 func encrypt(key []byte, plaintext string) (ciphertext, nonce []byte, err error) {

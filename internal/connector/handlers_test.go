@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Aryagorjipour/surface/internal/session"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -101,7 +101,7 @@ func TestRejectMalformed(t *testing.T) {
 
 	rec := postMux(mux, "/peers", peerJSON(longKey, "127.0.0.1:1", "available"))
 	requirePhrase(t, rec, http.StatusBadRequest, "key too long")
-	if _, _, _, err := store.GetPeer(context.Background(), longKey); err == nil {
+	if _, _, _, _, err := store.GetPeer(context.Background(), longKey); err == nil {
 		t.Fatal("long key was stored")
 	}
 
@@ -207,6 +207,9 @@ func TestConnectBusyStaysConflict(t *testing.T) {
 	mux := http.NewServeMux()
 	h.Register(mux)
 
+	if rec := postMux(mux, "/peers", peerJSON("caller", "127.0.0.1:8", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	for _, tc := range []struct{ key, state string }{
 		{"busy-peer", "busy"},
 		{"offline-peer", "offline"},
@@ -393,12 +396,16 @@ func TestKeyAllowanceHTTP(t *testing.T) {
 	h.mu.Lock()
 	h.byID["accept-id"] = &ConnectRequest{ID: "accept-id", Status: "pending", expiresAt: time.Now().Add(time.Hour)}
 	h.mu.Unlock()
-	for range 3 {
+	for i := range 3 {
 		rec = callMux(mux, http.MethodPost, "/requests/accept-id/accept", "", "")
 		if rec.Code == http.StatusTooManyRequests {
 			t.Fatal("accept consumed a key allowance")
 		}
-		if rec.Code != http.StatusOK {
+		want := http.StatusOK
+		if i > 0 {
+			want = http.StatusConflict
+		}
+		if rec.Code != want {
 			t.Fatalf("accept %d %s", rec.Code, rec.Body.String())
 		}
 	}
@@ -419,6 +426,12 @@ func TestPendingExpires(t *testing.T) {
 	rec := postMux(mux, "/peers", peerJSON("target", "203.0.113.1:1", "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = postMux(mux, "/peers", peerJSON("caller", "203.0.113.2:2", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = postMux(mux, "/peers", peerJSON("caller-new", "203.0.113.3:3", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller-new %d %s", rec.Code, rec.Body.String())
 	}
 
 	idA := mustConnect(t, mux, "caller", "target", "203.0.113.2:2")
@@ -450,7 +463,7 @@ func TestPendingExpires(t *testing.T) {
 	now = time.Date(2026, 10, 16, 12, 30, 0, 0, time.UTC)
 	idOld := mustConnect(t, mux, "caller", "target", "203.0.113.2:2")
 	now = now.Add(time.Second)
-	idNew := mustConnect(t, mux, "caller", "target", "203.0.113.2:2")
+	idNew := mustConnect(t, mux, "caller-new", "target", "203.0.113.3:3")
 	now = time.Date(2026, 10, 16, 12, 30, 0, 0, time.UTC).Add(life + time.Nanosecond)
 	pending := pendingBodies(t, mux, "target")
 	if pendingHas(pending, idOld, "pending") || !pendingHas(pending, idNew, "pending") {
@@ -563,6 +576,9 @@ func TestStalePeerNotFound(t *testing.T) {
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
 	rec = getReq(mux, "/peers/silent", "")
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
+	if rec = postMux(mux, "/peers", peerJSON("caller", "203.0.113.8:8", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	rec = postMux(mux, "/connect", connectJSON("caller", "silent", "203.0.113.8:8"))
 	requirePhrase(t, rec, http.StatusNotFound, "target not found")
 	if len(h.byID) != 0 {
@@ -577,7 +593,7 @@ func TestStalePeerNotFound(t *testing.T) {
 	now = registeredAt.Add(window + time.Second)
 	h.pruneOnce(context.Background())
 	h.SetSilenceWindow(24 * time.Hour)
-	addr, _, _, err := store.GetPeer(context.Background(), "untouched")
+	addr, _, _, _, err := store.GetPeer(context.Background(), "untouched")
 	if err == nil || err.Error() != "peer not found" || addr != "" {
 		t.Fatalf("untouched after prune: addr %q err %v", addr, err)
 	}
@@ -596,6 +612,9 @@ func TestStalePeerNotFound(t *testing.T) {
 	rec = postMux(mux, "/peers", peerJSON("live", "203.0.113.9:9", "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register live %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = postMux(mux, "/peers", peerJSON("caller", "203.0.113.8:8", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("refresh caller %d %s", rec.Code, rec.Body.String())
 	}
 	liveID := mustConnect(t, mux, "caller", "live", "203.0.113.8:8")
 	now = now.Add(window + time.Second)
@@ -681,6 +700,9 @@ func TestOperatorDurations(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
 	}
+	if rec = postMux(mux, "/peers", peerJSON("op-caller", "203.0.113.4:4", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	id := mustConnect(t, mux, "op-caller", "op-peer", "203.0.113.4:4")
 	now = now.Add(3*time.Second + time.Second)
 	rec = getReq(mux, "/pending?key=op-peer", "")
@@ -711,6 +733,9 @@ func TestExpiryLogsBare(t *testing.T) {
 	rec := postMux(mux, "/peers", peerJSON(peerKey, peerAddr, "available"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	if rec = postMux(mux, "/peers", peerJSON("bare-caller", fromAddr, "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
 	}
 	id := mustConnect(t, mux, "bare-caller", peerKey, fromAddr)
 	now = now.Add(2 * time.Second)
@@ -877,8 +902,14 @@ func (s *slogCapture) all() []slog.Record {
 	return out
 }
 
+func testPublicIdentity() string {
+	return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+}
+
 func peerJSON(key, address, state string) string {
-	b, err := json.Marshal(map[string]string{"key": key, "address": address, "state": state})
+	b, err := json.Marshal(map[string]string{
+		"key": key, "address": address, "state": state, "identity": testPublicIdentity(),
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -932,22 +963,20 @@ func callMuxToken(mux *http.ServeMux, method, target, body, addr, token string) 
 	return rec
 }
 
-func requireAccepted(t *testing.T, rec *httptest.ResponseRecorder) string {
+func requireAccepted(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
 		Status string `json:"status"`
-		Proof  string `json:"admission_proof"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Status != "accepted" || body.Proof == "" {
+	if body.Status != "accepted" || strings.Contains(rec.Body.String(), "admission_proof") {
 		t.Fatalf("body %s", rec.Body.String())
 	}
-	return body.Proof
 }
 
 func requirePhrase(t *testing.T, rec *httptest.ResponseRecorder, status int, want string) {
@@ -1159,6 +1188,9 @@ func TestRestartWithoutStore(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
 	}
+	if rec = postMux(mux, "/peers", peerJSON("caller", "203.0.113.2:2", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	rec = postMux(mux, "/connect", connectJSON("caller", "target", "203.0.113.2:2"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("connect %d %s", rec.Code, rec.Body.String())
@@ -1264,7 +1296,7 @@ func TestRestoreLogsBare(t *testing.T) {
 	}
 
 	failLog := &slogCapture{}
-	h4 := NewHandlers(store, NewRedis("127.0.0.1:1", secret), slog.New(failLog))
+	h4 := NewHandlers(store, NewRedis("127.0.0.1:1", secret, bytes.Repeat([]byte{9}, 32)), slog.New(failLog))
 	h4.mu.Lock()
 	h4.byID = map[string]*ConnectRequest{"seed": {ID: requestID, FromKey: callerKey, FromAddress: callerAddr, ToKey: targetKey}}
 	h4.byToKey = map[string][]string{targetKey: {requestID}}
@@ -1303,82 +1335,217 @@ func sawLog(records []slog.Record, message string, needCount bool) bool {
 	return false
 }
 
-func TestAcceptReturnsAdmissionProof(t *testing.T) {
+func TestSecondAcceptAfterReject(t *testing.T) {
 	store := testStore(t)
 	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
 	mux := http.NewServeMux()
 	h.Register(mux)
 
 	const (
-		caller = "proof-caller"
-		target = "proof-target"
+		caller = "reject-caller"
+		target = "reject-target"
 		addr   = "203.0.113.40:40"
 	)
-	rec := postMux(mux, "/peers", peerJSON(target, "203.0.113.41:41", "available"))
-	if rec.Code != http.StatusOK {
+	if rec := postMux(mux, "/peers", peerJSON(target, "203.0.113.41:41", "available")); rec.Code != http.StatusOK {
 		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
 	}
-	rec = postMux(mux, "/peers", peerJSON(caller, addr, "available"))
-	if rec.Code != http.StatusOK {
+	if rec := postMux(mux, "/peers", peerJSON(caller, addr, "available")); rec.Code != http.StatusOK {
 		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
 	}
 	id := mustConnect(t, mux, caller, target, addr)
-
-	rec = getReq(mux, "/requests/"+id, "")
-	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "admission_proof") || strings.Contains(rec.Body.String(), "expires_at") {
-		t.Fatalf("pending status %d %s", rec.Code, rec.Body.String())
-	}
-	pending := getReq(mux, "/pending?key="+target, "")
-	if strings.Contains(pending.Body.String(), "admission_proof") {
-		t.Fatalf("pending listed a proof: %s", pending.Body.String())
-	}
-	lookup := getReq(mux, "/peers/"+target, "")
-	if lookup.Code != http.StatusOK || strings.Contains(lookup.Body.String(), "admission_proof") || strings.Contains(lookup.Body.String(), "last_seen") {
-		t.Fatalf("lookup %d %s", lookup.Code, lookup.Body.String())
-	}
-
-	rec = postMux(mux, "/requests/"+id+"/accept", "")
-	proof := requireAccepted(t, rec)
-	raw, err := base64.StdEncoding.DecodeString(proof)
-	if err != nil || len(raw) != session.ProofBytes {
-		t.Fatalf("proof %q err %v len %d", proof, err, len(raw))
-	}
-	rec = getReq(mux, "/requests/"+id, "")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), proof) || strings.Contains(rec.Body.String(), "expires_at") {
-		t.Fatalf("accepted status %s", rec.Body.String())
-	}
-	again := getReq(mux, "/requests/"+id, "")
-	if !strings.Contains(again.Body.String(), proof) {
-		t.Fatalf("second status changed the proof: %s", again.Body.String())
-	}
-	if strings.Contains(getReq(mux, "/pending?key="+target, "").Body.String(), "admission_proof") {
-		t.Fatal("accepted proof appeared on the pending list")
-	}
-
-	rejectedID := mustConnect(t, mux, caller, target, addr)
-	rec = postMux(mux, "/requests/"+rejectedID+"/reject", "")
+	rec := postMux(mux, "/requests/"+id+"/reject", "")
 	requirePhrase(t, rec, http.StatusOK, `{"status":"rejected"}`)
 	if strings.Contains(rec.Body.String(), "admission_proof") {
-		t.Fatalf("reject minted a proof: %s", rec.Body.String())
+		t.Fatalf("reject body %s", rec.Body.String())
+	}
+	h.mu.RLock()
+	deadline := h.byID[id].expiresAt
+	h.mu.RUnlock()
+
+	for range 2 {
+		rec = postMux(mux, "/requests/"+id+"/accept", "")
+		requirePhrase(t, rec, http.StatusConflict, `{"status":"rejected"}`)
+		if strings.Contains(rec.Body.String(), "admission_proof") {
+			t.Fatalf("accept body %s", rec.Body.String())
+		}
+	}
+	got := getReq(mux, "/requests/"+id, "")
+	if got.Code != http.StatusOK || strings.Contains(got.Body.String(), "admission_proof") {
+		t.Fatalf("status %d %s", got.Code, got.Body.String())
+	}
+	var view requestView
+	if err := json.Unmarshal(got.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "rejected" {
+		t.Fatalf("status %s", got.Body.String())
+	}
+	h.mu.RLock()
+	row := h.byID[id]
+	h.mu.RUnlock()
+	if row == nil || row.Status != "rejected" || !row.expiresAt.Equal(deadline) {
+		t.Fatal("accept moved a rejected row")
+	}
+}
+
+type failRequestLog struct{}
+
+func (failRequestLog) SetRequest(context.Context, *ConnectRequest, time.Duration) error {
+	return errors.New("store down")
+}
+
+func TestRedisWriteFailure(t *testing.T) {
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	h.requests = failRequestLog{}
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		caller = "fail-caller"
+		target = "fail-target"
+		addr   = "203.0.113.1:1"
+	)
+	if rec := postMux(mux, "/peers", peerJSON(caller, addr, "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := postMux(mux, "/peers", peerJSON(target, "203.0.113.2:2", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register target %d %s", rec.Code, rec.Body.String())
+	}
+	rec := postMux(mux, "/connect", connectJSON(caller, target, addr))
+	requirePhrase(t, rec, http.StatusInternalServerError, "store error")
+	h.mu.RLock()
+	stored := len(h.byID)
+	h.mu.RUnlock()
+	if stored != 0 {
+		t.Fatal("failed connect stored a row")
 	}
 
-	kept := "kept-proof-value"
-	now := time.Date(2026, 10, 16, 18, 0, 0, 0, time.UTC)
-	// The deadline is compared with the handler clock, not the wall clock.
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	h.SetNow(func() time.Time { return now })
-	h.applyStored([]storedRequest{{
-		ConnectRequest: ConnectRequest{
-			ID: "stored-accepted", FromKey: caller, FromAddress: addr, ToKey: target,
-			Status: "accepted", Created: now, AdmissionProof: kept,
-		},
-		ExpiresAt: now.Add(time.Minute),
-	}})
-	rec = getReq(mux, "/requests/stored-accepted", "")
-	if !strings.Contains(rec.Body.String(), kept) || strings.Contains(rec.Body.String(), "expires_at") {
-		t.Fatalf("stored status %s", rec.Body.String())
+	const id = "seeded-pending"
+	h.mu.Lock()
+	h.insertLocked(&ConnectRequest{
+		ID: id, FromKey: caller, FromAddress: addr, ToKey: target,
+		Status: "pending", Created: now, expiresAt: now.Add(time.Hour),
+	})
+	h.mu.Unlock()
+	rec = postMux(mux, "/requests/"+id+"/accept", "")
+	requirePhrase(t, rec, http.StatusInternalServerError, "store error")
+	got := getReq(mux, "/requests/"+id, "")
+	if got.Code != http.StatusOK {
+		t.Fatalf("status %d %s", got.Code, got.Body.String())
 	}
-	if strings.Contains(getReq(mux, "/pending?key="+target, "").Body.String(), kept) {
-		t.Fatal("stored proof appeared on the pending list")
+	var view requestView
+	if err := json.Unmarshal(got.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != "pending" {
+		t.Fatalf("status %s", got.Body.String())
+	}
+}
+
+func TestIPv6Literal(t *testing.T) {
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		key  = "v6-peer"
+		addr = "[2001:db8::1]:9000"
+		from = "[2001:db8::7]:4400"
+	)
+	if rec := postMux(mux, "/peers", peerJSON(key, addr, "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register %d %s", rec.Code, rec.Body.String())
+	}
+	for range 2 {
+		rec := getReq(mux, "/peers/"+key, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("lookup %d %s", rec.Code, rec.Body.String())
+		}
+		var peer peerResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &peer); err != nil {
+			t.Fatal(err)
+		}
+		if peer.Address != addr {
+			t.Fatalf("address %q", peer.Address)
+		}
+	}
+	if rec := postMux(mux, "/peers", peerJSON("v6-caller", "[2001:db8::2]:9001", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
+	id := mustConnect(t, mux, "v6-caller", key, from)
+	rec := getReq(mux, "/requests/"+id, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+	}
+	var view requestView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.FromAddress != from {
+		t.Fatalf("from_address %q", view.FromAddress)
+	}
+	bad := postMux(mux, "/peers", peerJSON("bad-v6", "2001:db8::1:9000", "available"))
+	requirePhrase(t, bad, http.StatusBadRequest, "invalid address")
+}
+
+func TestConnectReplayReturnsSameID(t *testing.T) {
+	store := testStore(t)
+	h := newTestHandlers(store, nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	h.Register(mux)
+
+	const (
+		caller = "replay-caller"
+		target = "replay-target"
+		addr   = "203.0.113.10:10"
+		other  = "203.0.113.11:11"
+	)
+	if rec := postMux(mux, "/peers", peerJSON(caller, addr, "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := postMux(mux, "/peers", peerJSON(target, "203.0.113.12:12", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register target %d %s", rec.Code, rec.Body.String())
+	}
+	id := mustConnect(t, mux, caller, target, addr)
+	rec := postMux(mux, "/connect", connectJSON(caller, target, other))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("replay %d %s", rec.Code, rec.Body.String())
+	}
+	var created struct {
+		ID     string `json:"request_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.ID != id || created.Status != "pending" {
+		t.Fatalf("replay body %+v", created)
+	}
+	got := getReq(mux, "/requests/"+id, "")
+	var view requestView
+	if err := json.Unmarshal(got.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.FromAddress != addr {
+		t.Fatalf("address replaced %q", view.FromAddress)
+	}
+	rec = postMux(mux, "/requests/"+id+"/reject", "")
+	requirePhrase(t, rec, http.StatusOK, `{"status":"rejected"}`)
+	rec = postMux(mux, "/connect", connectJSON(caller, target, addr))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("new connect %d %s", rec.Code, rec.Body.String())
+	}
+	var again struct {
+		ID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &again); err != nil {
+		t.Fatal(err)
+	}
+	if again.ID == "" || again.ID == id {
+		t.Fatalf("new id %q", again.ID)
 	}
 }
 
@@ -1474,6 +1641,9 @@ func TestLivenessExactBoundary(t *testing.T) {
 	now = start.Add(window + time.Second)
 	rec = getReq(mux, "/peers/"+key, "")
 	requirePhrase(t, rec, http.StatusNotFound, "not found")
+	if rec = postMux(mux, "/peers", peerJSON("live-caller", "203.0.113.91:91", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("register caller %d %s", rec.Code, rec.Body.String())
+	}
 	rec = postMux(mux, "/connect", connectJSON("live-caller", key, "203.0.113.91:91"))
 	requirePhrase(t, rec, http.StatusNotFound, "target not found")
 	if strings.Contains(getReq(mux, "/pending?key="+key, "").Body.String(), "live-caller") {
@@ -1496,6 +1666,9 @@ func TestLivenessExactBoundary(t *testing.T) {
 	}
 	if body.State != "busy" || body.Address != addr {
 		t.Fatalf("busy lookup %+v", body)
+	}
+	if rec = postMux(mux, "/peers", peerJSON("live-caller", "203.0.113.91:91", "available")); rec.Code != http.StatusOK {
+		t.Fatalf("refresh caller %d %s", rec.Code, rec.Body.String())
 	}
 	rec = postMux(mux, "/connect", connectJSON("live-caller", busy, "203.0.113.91:91"))
 	requirePhrase(t, rec, http.StatusConflict, "target not connectable")
@@ -1530,6 +1703,7 @@ func TestActionSpans(t *testing.T) {
 
 	step("POST /peers", http.StatusOK, callMuxToken(mux, http.MethodPost, "/peers", peerJSON(key, addr, "available"), "", token))
 	step("GET /peers/{key}", http.StatusOK, callMuxToken(mux, http.MethodGet, "/peers/"+key, "", "", token))
+	step("POST /peers", http.StatusOK, callMuxToken(mux, http.MethodPost, "/peers", peerJSON("carol", addr, "available"), "", token))
 	connected := callMuxToken(mux, http.MethodPost, "/connect", connectJSON("carol", key, addr), "", token)
 	step("POST /connect", http.StatusCreated, connected)
 	var created struct {
@@ -1540,7 +1714,7 @@ func TestActionSpans(t *testing.T) {
 	}
 	step("GET /pending", http.StatusOK, callMuxToken(mux, http.MethodGet, "/pending?key="+key, "", "", token))
 	step("POST /requests/{id}/accept", http.StatusOK, callMuxToken(mux, http.MethodPost, "/requests/"+created.ID+"/accept", "", "", token))
-	step("POST /requests/{id}/reject", http.StatusOK, callMuxToken(mux, http.MethodPost, "/requests/"+created.ID+"/reject", "", "", token))
+	step("POST /requests/{id}/reject", http.StatusConflict, callMuxToken(mux, http.MethodPost, "/requests/"+created.ID+"/reject", "", "", token))
 	step("GET /requests/{id}", http.StatusOK, callMuxToken(mux, http.MethodGet, "/requests/"+created.ID, "", "", token))
 
 	unauthorized := callMuxToken(mux, http.MethodPost, "/peers", peerJSON(key, addr, "available"), "192.0.2.20:20", "")
