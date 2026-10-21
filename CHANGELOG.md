@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.1] - 2026-10-21
+
+**The Quiet Relay**
+
+### Added
+
+- Connector container image is published to GHCR on release tags (`ghcr.io/aryagorjipour/surface-connector`).
+
+### Changed
+
+- Release workflow now builds and pushes the connector image alongside the binaries and SLSA attestation.
+
 ## [0.1.0] - 2026-10-21
 
 First public release.
