@@ -21,7 +21,7 @@ First public release.
 - Accept and status responses no longer carry an admission proof. Each Surface derives the handshake key from the two peer identities snapped onto the request. Accept and reject apply only while the request is pending. A second connect for that pending pair returns the original id.
 - An enabled Redis address requires a password. Request values are sealed with the same AES-GCM key as peer addresses in SQLite. A failed write fails the HTTP call.
 - `--tls-cert` with `--tls-key` serves the Connector over TLS. `--direct-cert` with `--direct-key` uses `wss` for the direct socket. Leaving both unset keeps local cleartext.
-- Builds use Go 1.27.2 and golang.org/x/net v0.60.0.
+- Builds use Go 1.27.3 and golang.org/x/net v0.60.0.
 - The local stack allows 240 requests per source per minute, so two Surfaces on one machine can poll, connect, and accept. A refused call is reported as `too many requests`.
 - A file-backed connector store keeps one SQLite connection open, so two peers can register together.
 - Connector spans record the route endpoint and the HTTP status.
@@ -53,7 +53,7 @@ First public release.
 - Accept and status responses no longer carry an admission proof. Each Surface derives the handshake key from the two peer identities snapped onto the request. Accept and reject apply only while the request is pending. A second connect for that pending pair returns the original id.
 - An enabled Redis address requires a password. Request values are sealed with the same AES-GCM key as peer addresses in SQLite. A failed write fails the HTTP call.
 - `--tls-cert` with `--tls-key` serves the Connector over TLS. `--direct-cert` with `--direct-key` uses `wss` for the direct socket. Leaving both unset keeps local cleartext.
-- Builds use Go 1.27.2 and golang.org/x/net v0.60.0.
+- Builds use Go 1.27.3 and golang.org/x/net v0.60.0.
 - The local stack allows 240 requests per source per minute, so two Surfaces on one machine can poll, connect, and accept. A refused call is reported as `too many requests`.
 - A file-backed connector store keeps one SQLite connection open, so two peers can register together.
 - Connector spans record the route endpoint and the HTTP status.
