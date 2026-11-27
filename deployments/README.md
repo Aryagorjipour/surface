@@ -96,6 +96,92 @@ running. Stop `server-dev` first.
 
 Ctrl+C stops the container. The recipe removes it on exit.
 
+## Run a connector for other people
+
+Use this when people on other machines will use the connector this
+machine starts.
+
+Put the connector secrets in Vault at `secret/data/surface/connector`
+before you start.
+
+Set these required keys:
+
+- `turso_url`
+- `turso_token`
+- `encryption_key` as base64 of 32 bytes
+- `connector_token`
+
+`redis_addr` and `redis_password` are optional. Leave `redis_addr`
+empty, or set it to `redis:6379`, to leave Redis off. Any other
+address requires `redis_password`.
+
+Do not copy the local-stack token, encryption key, or Vault root
+token. [DATA.md](../DATA.md) lists those values.
+
+Set `VAULT_ADDR` and `VAULT_TOKEN` as the stage and production section
+describes. Then run `just server-production`. `just server-stage` uses
+the same Dockerfile, ports, and flags.
+
+The recipe builds `deployments/Dockerfile.connector`. The build stage
+uses `golang:1.27.4-alpine`. The recipe requires `VAULT_ADDR` and
+`VAULT_TOKEN`. It sets `SURFACE_PUNCH_ADDR=:8081`. It publishes 8080
+and 8081 with
+`-p 8080:8080 -p 8081:8081`.
+
+Those flags publish TCP. Punch listens on UDP. This recipe does not
+publish punch to other machines.
+
+The recipe does not mount TLS files. It does not create a DNS name.
+It does not pass `--tls-cert` or `--tls-key`. When both flags are
+unset, the connector speaks cleartext.
+
+Do not put a cleartext connector on a public address. The network can
+read peer addresses and keys.
+
+Tell guests to use `http` on port 8080. This recipe does not enable
+TLS. Give them that URL and the `connector_token` value. `GET /health`
+on that URL returns a body that starts with `ok`. That route does not
+use the token.
+
+Tell each guest to pass a listen address the other peer can dial.
+`127.0.0.1` works only for two clients on one machine. The guest
+command is in [Point surface at a connector](#point-surface-at-a-connector).
+
+`connector --ready` probes `http://127.0.0.1:8080/health` on the
+connector machine. It uses `https` when a TLS certificate is set.
+This recipe does not set a certificate.
+
+## Point surface at a connector
+
+Use this when an operator gave you a connector URL and a token.
+
+Download the v0.2.0 `surface` binary for your machine. Check it with
+[Verify a release](../README.md#verify-a-release).
+
+Do not use `just surface` for that connector. `just surface` is a dev
+client. It runs `go run ./cmd/surface` against `http://127.0.0.1:8080`
+and defaults the token to `dev`.
+
+```sh
+export SURFACE_CONNECTOR_TOKEN=<token from the operator>
+./surface_v0.2.0_linux_amd64 <connector-url> <my-key> <listen-addr>
+```
+
+Use the file name you downloaded. Windows names end in `.exe`.
+
+The listen address is the address the other peer dials. Use
+`127.0.0.1:9001` when both clients are on one machine. That is the
+default when you omit the listen address. A person on another machine
+needs an address that machine can reach.
+
+`SURFACE_CONNECTOR_TOKEN` is required.
+
+After the program starts, use the commands in the dev client section.
+A terminal opens the keyboard UI. A pipe keeps the line commands.
+
+Direct sockets stay cleartext unless you pass `--direct-cert` and
+`--direct-key`. The just recipes do not pass those flags.
+
 ## When these pages change
 
 Update `justfile`, the `just help` text, the README run section, and
