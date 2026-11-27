@@ -41,4 +41,4 @@ A relay the operator runs can see the size and the timing of each write. The soc
 
 The connector token is not per-user authentication. Anyone with the token can register and look up peers. [DATA.md](DATA.md) lists the fields those calls return.
 
-The connector speaks cleartext unless `--tls-cert` and `--tls-key` are both set. When both are unset, register and lookup send peer keys, addresses, and identities in cleartext.
+The connector speaks cleartext unless `--tls-cert` and `--tls-key` are both set. When both are unset, register and lookup send peer keys, addresses, identities, and the bearer token in cleartext.

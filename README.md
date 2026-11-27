@@ -12,7 +12,7 @@ Two people can chat in a terminal after the connector introduces them. One `surf
 
 Every caller uses one shared token. The connector does not keep user accounts. This repository does not publish a connector address. You get the URL and the token from the operator.
 
-The connector speaks cleartext unless `--tls-cert` and `--tls-key` are both set. A direct socket uses `ws` unless you set `--direct-cert` and `--direct-key`. With both set, the socket uses `wss`. Do not put a cleartext connector on a public address. The network can read peer addresses and keys.
+The connector speaks cleartext unless `--tls-cert` and `--tls-key` are both set. A direct socket uses `ws` unless you set `--direct-cert` and `--direct-key`. With both set, the socket uses `wss`. Do not put a cleartext connector on a public address. The network can read peer addresses, peer keys, and the connector token.
 
 The relay is temporary and optional. Stored fields are in [DATA.md](DATA.md). The run book is [deployments/README.md](deployments/README.md). The release notes are in [CHANGELOG.md](CHANGELOG.md). The license is [MIT](LICENSE).
 
@@ -31,7 +31,7 @@ export SURFACE_CONNECTOR_TOKEN=<token>
 
 The listen address is the address the other peer dials. The default is `127.0.0.1:9001`. Use that when both clients are on one machine. A person on another machine needs an address that machine can reach.
 
-`just surface` is a dev client only. It runs `go run ./cmd/surface` against `http://127.0.0.1:8080` and defaults the token to `dev`. There is no stage client and no production client.
+`just surface` is a dev client only. It talks to the connector on this machine and uses the local-stack token. There is no stage client and no production client. The command is in [deployments/README.md](deployments/README.md).
 
 ## Publish a release
 
