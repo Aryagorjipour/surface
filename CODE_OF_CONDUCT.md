@@ -34,6 +34,10 @@ Community leaders have the right and responsibility to remove, edit, or reject c
 
 This Code of Conduct applies within all community spaces, and also applies when an individual is officially representing the community in public spaces. Examples of representing our community include using an official e-mail address, posting via an official social media account, or acting as an appointed representative at an online or offline event.
 
+## What a public report contains
+
+The only channel is a public issue whose title starts with `Conduct report:`. The issue is public. Do not put another person's private contact details in it. Do not put an undisclosed flaw in it. Aryagorjipour reads those issues. There is no private email.
+
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at https://github.com/Aryagorjipour/surface/issues/new by opening a public issue whose title starts with `Conduct report:`. There is no private conduct channel and no email. Conduct reports do not go to GitHub private vulnerability reporting. All complaints will be reviewed and investigated promptly and fairly.
