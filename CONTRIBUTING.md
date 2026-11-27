@@ -12,6 +12,24 @@ Published checks must pass before acceptance. Those checks are vet, test,
 both program builds (`cmd/connector` and `cmd/surface`), the reproducible
 release build, govulncheck, and lint.
 
+## Local checks
+
+Run these from the repository root. CI uses Go 1.27.4 from `go.mod`.
+
+```sh
+go vet ./...
+go test -race -count=1 -timeout 5m ./...
+go build -o bin/connector ./cmd/connector
+go build -o bin/surface ./cmd/surface
+bash scripts/release_test.sh
+bash scripts/govulncheck.sh
+golangci-lint run --timeout 5m
+```
+
+Use golangci-lint v2.14.0 for the last command. CI pins that version.
+
+`just` 1.58.0 or newer and Docker are for the run book. See [deployments/README.md](deployments/README.md). The commands in this section do not need them.
+
 A change that adds behavior includes a check that fails before the change
 and passes after it.
 
