@@ -24,6 +24,7 @@ type surfaceConfig struct {
 	relay     string
 	punch     string
 	maxChats  int
+	maxNamed  bool
 	mailbox   time.Duration
 	direct    shared.CertPair
 	directCA  string
@@ -181,6 +182,7 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 	if !punchSet && len(fs.Args()) > 0 {
 		punch = defaultPunch(fs.Args()[0])
 	}
+	_, maxNamed := merged("SURFACE_MAX_CHATS")
 	maxChats, err := positiveInt(merged, "SURFACE_MAX_CHATS", 4)
 	if err != nil {
 		return surfaceConfig{}, err
@@ -203,6 +205,7 @@ func parseSurface(args []string, lookup func(string) (string, bool)) (surfaceCon
 		relay:     relay,
 		punch:     punch,
 		maxChats:  maxChats,
+		maxNamed:  maxNamed,
 		mailbox:   mailboxTTL,
 		direct:    pair,
 		directCA:  caPath,

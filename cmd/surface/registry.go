@@ -92,6 +92,115 @@ func (r *Registry) Attach(req AttachReq) (*Conversation, error) {
 	return c, nil
 }
 
+func (r *Registry) SetMax(n int) {
+	if r == nil || n < 1 {
+		return
+	}
+	r.mu.Lock()
+	r.max = n
+	r.mu.Unlock()
+}
+
+func (r *Registry) Max() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.max
+}
+
+func (r *Registry) MarkBootstrap(id ConvID, until time.Time) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	c := r.byID[id]
+	r.mu.Unlock()
+	if c == nil {
+		return
+	}
+	c.stateMu.Lock()
+	c.bootstrap = true
+	c.budget = until
+	c.stateMu.Unlock()
+}
+
+func (r *Registry) Bootstrap(id ConvID) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	c := r.byID[id]
+	r.mu.Unlock()
+	if c == nil {
+		return false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.bootstrap
+}
+
+func (r *Registry) bootstrapOpen(id ConvID) bool {
+	if r == nil || !r.Bootstrap(id) {
+		return false
+	}
+	r.mu.Lock()
+	c := r.byID[id]
+	r.mu.Unlock()
+	if c == nil {
+		return false
+	}
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.budget.IsZero() || time.Now().Before(c.budget)
+}
+
+func (r *Registry) Migrate(id ConvID, conn byteConn, sess *session.Session) error {
+	if r == nil {
+		if conn != nil {
+			_ = conn.CloseNow()
+		}
+		return ErrUnknownConv
+	}
+	r.mu.Lock()
+	c := r.byID[id]
+	r.mu.Unlock()
+	if c == nil || conn == nil || sess == nil {
+		if conn != nil {
+			_ = conn.CloseNow()
+		}
+		return ErrUnknownConv
+	}
+	select {
+	case c.inbox <- cmdMigrate{conn: conn, sess: sess}:
+		return nil
+	case <-c.ctx.Done():
+		_ = conn.CloseNow()
+		return c.ctx.Err()
+	}
+}
+
+func (r *Registry) DropBootstrap(id ConvID) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	c := r.byID[id]
+	r.mu.Unlock()
+	if c == nil {
+		return false
+	}
+	c.stateMu.Lock()
+	boot := c.bootstrap
+	c.stateMu.Unlock()
+	if !boot {
+		return false
+	}
+	c.cancel()
+	return true
+}
+
 func (r *Registry) Focus(id ConvID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

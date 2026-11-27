@@ -490,9 +490,9 @@ func TestHandleLineQuitEndsOnlyFocused(t *testing.T) {
 }
 
 func TestConnectReportsRateLimit(t *testing.T) {
-	prev := acceptPoll
-	acceptPoll = time.Millisecond
-	t.Cleanup(func() { acceptPoll = prev })
+	prev := loadAcceptPoll()
+	setAcceptPoll(time.Millisecond)
+	t.Cleanup(func() { setAcceptPoll(prev) })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -560,5 +560,139 @@ func TestPendingRateLimitIsNotADecodeError(t *testing.T) {
 	}
 	if !strings.Contains(text, "too many requests") {
 		t.Fatalf("log: %s", text)
+	}
+}
+
+func TestLimitLaunchAndAudit(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fresh := func() *app {
+		return &app{ctx: ctx, cancel: cancel, maxChats: 4, auditShow: 10}
+	}
+	first := fresh()
+	first.loadSavedLimit()
+	if first.maxChats != 4 || first.savedPresent {
+		t.Fatalf("start %+v", first.maxChats)
+	}
+	if err := first.setSessionLimit(6); err != nil {
+		t.Fatal(err)
+	}
+	first.saveSessionLimit("")
+	second := fresh()
+	second.loadSavedLimit()
+	if second.maxChats != 6 || !second.savedPresent {
+		t.Fatalf("file start %d present %v", second.maxChats, second.savedPresent)
+	}
+	doc, err := os.ReadFile("surface-limits/config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	named := fresh()
+	named.maxChats = 2
+	named.maxNamed = true
+	named.loadSavedLimit()
+	if named.maxChats != 2 {
+		t.Fatalf("named %d", named.maxChats)
+	}
+	after, err := os.ReadFile("surface-limits/config.json")
+	if err != nil || string(after) != string(doc) {
+		t.Fatal("named launch wrote the file")
+	}
+	both := captureStdout(t, func() {
+		if err := named.handleLine("/limit"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(both, "session limit 2") || !strings.Contains(both, "saved limit 6") {
+		t.Fatalf("both %q", both)
+	}
+	if err := named.handleLine("/limit 8"); err != nil {
+		t.Fatal(err)
+	}
+	if named.maxChats != 8 {
+		t.Fatalf("session %d", named.maxChats)
+	}
+	if _, err := os.Stat("surface-limits/config.json"); err != nil {
+		t.Fatal(err)
+	}
+	still, _ := os.ReadFile("surface-limits/config.json")
+	if string(still) != string(doc) {
+		t.Fatal("/limit 8 wrote the file")
+	}
+	saved := captureStdout(t, func() {
+		if err := named.handleLine("/limit save desk"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	body, _ := os.ReadFile("surface-limits/config.json")
+	if !strings.Contains(string(body), `"reason":"desk"`) {
+		t.Fatalf("save %s out %s", body, saved)
+	}
+	empty := fresh()
+	text := captureStdout(t, func() {
+		if err := empty.handleLine("/audit"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(text, "no saved changes") {
+		t.Fatalf("empty %q", text)
+	}
+	loaded := fresh()
+	loaded.loadSavedLimit()
+	prev := loaded.auditShow
+	bad := captureStdout(t, func() {
+		_ = loaded.handleLine("/audit 0")
+		_ = loaded.handleLine("/audit 101")
+	})
+	if !strings.Contains(bad, "show the most recent 1 to 100 entries") || loaded.auditShow != prev {
+		t.Fatalf("count %d out %q", loaded.auditShow, bad)
+	}
+	one := captureStdout(t, func() {
+		_ = loaded.handleLine("/audit 1")
+	})
+	if strings.Count(one, "\n") != 0 && len(strings.Fields(one)) < 3 {
+		t.Fatalf("one %q", one)
+	}
+	for loaded.savedVersion < 12 {
+		n := 5
+		if loaded.maxChats == 5 {
+			n = 7
+		}
+		_ = loaded.setSessionLimit(n)
+		loaded.saveSessionLimit("")
+	}
+	shown := captureStdout(t, func() {
+		loaded.auditShow = 10
+		_ = loaded.handleLine("/audit")
+	})
+	lines := strings.Split(strings.TrimSpace(shown), "\n")
+	if len(lines) != 10 {
+		t.Fatalf("lines %d %q", len(lines), shown)
+	}
+	if !strings.HasPrefix(lines[0], "12 ") {
+		t.Fatalf("order %q", lines[0])
+	}
+	peer := fresh()
+	peer.loadSavedLimit()
+	_ = peer.setSessionLimit(1)
+	mine := fresh()
+	mine.loadSavedLimit()
+	mine.initRegistry()
+	_ = mine.setSessionLimit(9)
+	attachPipe(t, mine.registry, "req-a", "amy")
+	attachPipe(t, mine.registry, "req-b", "bea")
+	peer.saveSessionLimit("winner")
+	conflict := captureStdout(t, func() {
+		mine.saveSessionLimit("loser")
+	})
+	if !strings.Contains(conflict, "saved limit changed in another session; latest values loaded") {
+		t.Fatalf("conflict %q", conflict)
+	}
+	if mine.maxChats != peer.savedLimit {
+		t.Fatalf("session %d saved %d", mine.maxChats, peer.savedLimit)
+	}
+	if mine.limitWarn != "open chats stay open; new chats are blocked" {
+		t.Fatalf("warning %q", mine.limitWarn)
 	}
 }

@@ -46,14 +46,16 @@ type Conversation struct {
 	secure bool
 	roots  *x509.CertPool
 
-	stateMu  sync.Mutex
-	sess     *session.Session
-	carrier  carrierState
-	lines    []string
-	unread   int
-	gen      uint64
-	quitting bool
-	ended    bool
+	stateMu   sync.Mutex
+	sess      *session.Session
+	carrier   carrierState
+	lines     []string
+	unread    int
+	gen       uint64
+	quitting  bool
+	ended     bool
+	bootstrap bool
+	budget    time.Time
 }
 
 type AttachReq struct {
@@ -163,6 +165,11 @@ func (c *Conversation) run() {
 				stopTimer()
 				c.doResume(cmd.conn, cmd.sess)
 				c.startRead()
+			case cmdMigrate:
+				stopTimer()
+				if c.doMigrate(cmd.conn, cmd.sess) {
+					c.startRead()
+				}
 			case cmdBreak:
 				until, arm := c.doBreak(cmd.from, cmd.gen)
 				if !arm {
@@ -316,6 +323,30 @@ func (c *Conversation) doQuit() {
 		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}
 	c.emit(EvEnded, "quit")
+}
+
+func (c *Conversation) doMigrate(conn byteConn, sess *session.Session) bool {
+	c.stateMu.Lock()
+	if !c.bootstrap || c.ended || c.quitting || conn == nil || sess == nil {
+		c.stateMu.Unlock()
+		if conn != nil {
+			_ = conn.CloseNow()
+		}
+		return false
+	}
+	var old byteConn
+	if live, ok := c.carrier.(carrierLive); ok {
+		old = live.conn
+	}
+	c.sess = sess
+	c.gen++
+	c.bootstrap = false
+	c.carrier = carrierLive{conn: conn}
+	c.stateMu.Unlock()
+	if old != nil && old != conn {
+		_ = old.CloseNow()
+	}
+	return true
 }
 
 func (c *Conversation) doResume(conn byteConn, sess *session.Session) {
@@ -534,6 +565,13 @@ type cmdResume struct {
 }
 
 func (cmdResume) convCmd() {}
+
+type cmdMigrate struct {
+	conn byteConn
+	sess *session.Session
+}
+
+func (cmdMigrate) convCmd() {}
 
 type cmdBreak struct {
 	from byteConn

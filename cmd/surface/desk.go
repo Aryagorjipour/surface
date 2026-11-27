@@ -79,7 +79,7 @@ func (a *app) acceptRequest(id string) error {
 	}
 	a.initRegistry()
 	if a.registry.AtCapacity() {
-		a.println("at capacity")
+		a.println("new chats are blocked")
 		return ErrAtCapacity
 	}
 	if err := a.ensureIdentity(); err != nil {

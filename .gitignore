@@ -35,6 +35,7 @@ go.work.sum
 
 data/
 surface-identity/
+surface-limits/
 *.enc
 .env
 bin/

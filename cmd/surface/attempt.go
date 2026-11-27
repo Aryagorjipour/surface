@@ -8,10 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Aryagorjipour/surface/internal/hostport"
@@ -20,12 +21,24 @@ import (
 )
 
 var (
-	attemptBudget = 30 * time.Second
-	dialTimeout   = 2 * time.Second
-	acceptPoll    = time.Second
+	attemptBudget atomic.Int64
+	dialTimeout   atomic.Int64
+	acceptPoll    atomic.Int64
 	punchEvery    = 100 * time.Millisecond
 	wsClient      = &http.Client{Transport: happyTransport()}
 )
+
+func init() {
+	attemptBudget.Store(int64(20 * time.Second))
+	dialTimeout.Store(int64(2 * time.Second))
+	acceptPoll.Store(int64(time.Second))
+}
+
+func loadAttemptBudget() time.Duration { return time.Duration(attemptBudget.Load()) }
+
+func loadDialTimeout() time.Duration { return time.Duration(dialTimeout.Load()) }
+
+func loadAcceptPoll() time.Duration { return time.Duration(acceptPoll.Load()) }
 
 func happyTransport() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -67,41 +80,84 @@ func dialWebSocket(ctx context.Context, addr hostport.Addr) (*websocket.Conn, er
 	return dialPeer(ctx, addr, false, nil)
 }
 
-func setAttemptBudget(d time.Duration) { attemptBudget = d }
+func setAttemptBudget(d time.Duration) { attemptBudget.Store(int64(d)) }
 
-func setDialTimeout(d time.Duration) { dialTimeout = d }
+func setDialTimeout(d time.Duration) { dialTimeout.Store(int64(d)) }
+
+func setAcceptPoll(d time.Duration) { acceptPoll.Store(int64(d)) }
 
 func (a *app) attempt(dialer bool, addr, id, caller, target string, proof session.HandshakeKey) error {
-	budget := attemptBudget
-	if dialer && acceptPoll < budget {
-		budget -= acceptPoll
+	budget := loadAttemptBudget()
+	if dialer && loadAcceptPoll() < budget {
+		budget -= loadAcceptPoll()
 	}
 	ctx, cancel := context.WithDeadline(a.ctx, time.Now().Add(budget))
-	defer cancel()
-	defer a.postDone(id)
-
-	if dialer {
-		if a.dialDirect(ctx, addr, id, caller, target, proof) {
-			return nil
-		}
-	} else if a.waitConnected(ctx, dialTimeout, id) {
+	started := make(chan struct{})
+	go func() {
+		defer cancel()
+		defer a.postDone(id)
+		a.runAttempt(ctx, dialer, addr, id, caller, target, proof, started)
+	}()
+	select {
+	case <-started:
+		return nil
+	case <-ctx.Done():
+		return nil
+	case <-a.ctx.Done():
 		return nil
 	}
-	if ctx.Err() != nil {
-		return a.failAttempt(ctx)
+}
+
+func (a *app) runAttempt(ctx context.Context, dialer bool, addr, id, caller, target string, proof session.HandshakeKey, started chan struct{}) {
+	var once sync.Once
+	release := func() { once.Do(func() { close(started) }) }
+	defer release()
+	if dialer {
+		if a.dialDirect(ctx, addr, id, caller, target, proof) {
+			return
+		}
+	} else if a.waitDirect(ctx, loadDialTimeout(), id) {
+		return
 	}
-	go a.fallbacks(ctx, id, caller, target, proof, dialer)
+	if ctx.Err() != nil {
+		_ = a.failAttempt(ctx, id)
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		a.fallbacks(ctx, id, caller, target, proof, dialer)
+		close(done)
+	}()
+	var nextDial time.Time
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
-		if a.chatting(id) {
-			cancel()
-			return nil
+		if a.directReady(id) {
+			return
+		}
+		if a.onBootstrap(id) {
+			release()
 		}
 		select {
 		case <-ctx.Done():
-			return a.failAttempt(ctx)
+			_ = a.failAttempt(ctx, id)
+			return
+		case <-done:
+			done = nil
+			if a.directReady(id) {
+				return
+			}
+			if !a.onBootstrap(id) && strings.TrimSpace(a.relayAddr) == "" {
+				_ = a.failAttempt(ctx, id)
+				return
+			}
 		case <-tick.C:
+			if dialer && a.onBootstrap(id) && !time.Now().Before(nextDial) {
+				nextDial = time.Now().Add(50 * time.Millisecond)
+				if a.dialDirect(ctx, a.directAddr(target, addr), id, caller, target, proof) {
+					return
+				}
+			}
 		}
 	}
 }
@@ -118,14 +174,76 @@ func (a *app) fallbacks(ctx context.Context, id, caller, target string, proof se
 	}
 }
 
-func (a *app) failAttempt(ctx context.Context) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		a.say("traversal failed")
-		if a.registry == nil || a.registry.Len() == 0 {
-			a.markPhase(phaseLobby)
+const (
+	phraseRelayStopped = "direct connection was not established in time; the temporary relay has stopped"
+	phraseNoRelay      = "direct connection was not established"
+)
+
+func (a *app) failAttempt(ctx context.Context, id string) error {
+	if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		if a.registry != nil {
+			_ = a.registry.DropBootstrap(ConvID(id))
 		}
+		return nil
+	}
+	dropped := false
+	if a.registry != nil {
+		dropped = a.registry.DropBootstrap(ConvID(id))
+	}
+	if a.directReady(id) {
+		return nil
+	}
+	phrase := phraseNoRelay
+	if dropped || strings.TrimSpace(a.relayAddr) != "" {
+		phrase = phraseRelayStopped
+	}
+	a.say(phrase)
+	a.refreshLimitWarning()
+	if a.registry == nil || a.registry.Len() == 0 {
+		a.markPhase(phaseLobby)
 	}
 	return nil
+}
+
+func (a *app) directReady(id string) bool {
+	if a.registry == nil || !a.registry.Has(ConvID(id)) {
+		return false
+	}
+	return !a.registry.Bootstrap(ConvID(id))
+}
+
+func (a *app) onBootstrap(id string) bool {
+	return a.registry != nil && a.registry.Bootstrap(ConvID(id))
+}
+
+func (a *app) directAddr(target, fallback string) string {
+	if strings.TrimSpace(target) == "" {
+		return fallback
+	}
+	peer, err := a.lookup(target)
+	if err != nil || peer == nil || strings.TrimSpace(peer.Address) == "" {
+		return fallback
+	}
+	return peer.Address
+}
+
+func (a *app) waitDirect(ctx context.Context, d time.Duration, id string) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if a.directReady(id) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return a.directReady(id)
+		case <-timer.C:
+			return a.directReady(id)
+		case <-tick.C:
+		}
+	}
 }
 
 func (a *app) chatting(id string) bool {
@@ -135,31 +253,12 @@ func (a *app) chatting(id string) bool {
 	return a.registry.Has(ConvID(id))
 }
 
-func (a *app) waitConnected(ctx context.Context, d time.Duration, id string) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if a.chatting(id) {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return a.chatting(id)
-		case <-timer.C:
-			return a.chatting(id)
-		case <-tick.C:
-		}
-	}
-}
-
 func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, proof session.HandshakeKey) bool {
 	addr, err := hostport.Parse(raw)
 	if err != nil {
 		return false
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, loadDialTimeout())
 	c, err := dialPeer(dialCtx, addr, a.directSecure, a.directRoots)
 	cancel()
 	if err != nil {
@@ -170,8 +269,16 @@ func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, pr
 		_ = c.Close(websocket.StatusPolicyViolation, "")
 		return false
 	}
+	if a.onBootstrap(id) {
+		if err := a.registry.Migrate(ConvID(id), c, sess); err != nil {
+			_ = c.Close(websocket.StatusPolicyViolation, "")
+			return false
+		}
+		a.say(connectedPrompt(true))
+		return true
+	}
 	a.say(connectedPrompt(true))
-	if !a.beginChat(c, sess, true, addr, ConvID(id), target) {
+	if !a.beginChat(c, sess, true, addr, ConvID(id), target, false, time.Time{}) {
 		_ = c.Close(websocket.StatusNormalClosure, "")
 	}
 	return true
@@ -325,7 +432,7 @@ func (a *app) udpDial(ctx context.Context, conn *net.UDPConn, remote *net.UDPAdd
 		if err != nil {
 			return false
 		}
-		if a.beginChat(link, sess, true, addr, ConvID(id), target) {
+		if a.beginChat(link, sess, true, addr, ConvID(id), target, false, time.Time{}) {
 			a.say(connectedPrompt(true))
 			return true
 		}
@@ -358,7 +465,7 @@ func (a *app) udpAccept(ctx context.Context, conn *net.UDPConn, remote *net.UDPA
 		if err != nil {
 			return false
 		}
-		if a.beginChat(link, sess, false, addr, ConvID(id), caller) {
+		if a.beginChat(link, sess, false, addr, ConvID(id), caller, false, time.Time{}) {
 			a.say("\n" + connectedPrompt(false))
 			return true
 		}
@@ -377,23 +484,13 @@ func (a *app) takeUDPOffer(cache *offerCache, msg []byte, id, caller, target str
 }
 
 func (a *app) acceptDirect(msg []byte, id, caller, target string, proof session.HandshakeKey) ([]byte, *session.Session, error) {
-	a.gate.mu.Lock()
-	_, spent := a.gate.live[id]
-	a.gate.mu.Unlock()
-	reply, sess, err := session.AcceptOffer(msg, id, caller, target, proof, spent)
+	reply, sess, err := session.AcceptOffer(msg, id, caller, target, proof, a.gate.alreadyAdmitted(id))
 	if err != nil {
 		return nil, nil, err
 	}
-	a.gate.mu.Lock()
-	if a.gate.live == nil {
-		a.gate.live = map[string]*session.Session{}
+	if err := a.gate.admit(id, sess); err != nil {
+		return nil, nil, err
 	}
-	if _, exists := a.gate.live[id]; exists {
-		a.gate.mu.Unlock()
-		return nil, nil, fmt.Errorf("refused")
-	}
-	a.gate.live[id] = sess
-	a.gate.mu.Unlock()
 	return reply, sess, nil
 }
 
@@ -432,7 +529,7 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof se
 		if err != nil {
 			return
 		}
-		if a.beginChat(link, sess, true, hostport.Addr{}, ConvID(id), target) {
+		if a.beginChat(link, sess, true, hostport.Addr{}, ConvID(id), target, true, deadlineOf(ctx)) {
 			owned = false
 			a.say(connectedPrompt(true))
 		}
@@ -449,8 +546,19 @@ func (a *app) relayPath(ctx context.Context, id, caller, target string, proof se
 	if err := link.Write(ctx, websocket.MessageBinary, reply); err != nil {
 		return
 	}
-	if a.beginChat(link, sess, false, hostport.Addr{}, ConvID(id), caller) {
+	if a.beginChat(link, sess, false, hostport.Addr{}, ConvID(id), caller, true, deadlineOf(ctx)) {
 		owned = false
 		a.say("\n" + connectedPrompt(false))
 	}
+}
+
+func deadlineOf(ctx context.Context) time.Time {
+	if ctx == nil {
+		return time.Time{}
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Time{}
+	}
+	return deadline
 }

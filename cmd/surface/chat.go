@@ -21,11 +21,13 @@ func connectedPrompt(dialer bool) string {
 }
 
 type Gate struct {
-	mu       sync.Mutex
-	live     map[string]*session.Session
-	invites  map[string]invite
-	readable func(requestID string) bool
-	until    func(requestID string) time.Time
+	mu          sync.Mutex
+	live        map[string]*session.Session
+	invites     map[string]invite
+	extra       map[string]bool
+	readable    func(requestID string) bool
+	until       func(requestID string) time.Time
+	bootstrapOK func(requestID string) bool
 }
 
 type invite struct {
@@ -83,19 +85,56 @@ func (g *Gate) acceptAdmitted(ctx context.Context, conn byteConn, requestID, cal
 	return g.finishAdmit(ctx, conn, msg, requestID, callerKey, targetKey, key, ready)
 }
 
+func (g *Gate) alreadyAdmitted(id string) bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	_, exists := g.live[id]
+	used := g.extra[id]
+	allow := g.bootstrapOK
+	g.mu.Unlock()
+	if !exists {
+		return false
+	}
+	if allow != nil && allow(id) && !used {
+		return false
+	}
+	return true
+}
+
+func (g *Gate) admit(id string, sess *session.Session) error {
+	if g == nil || sess == nil {
+		return fmt.Errorf("refused")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.live == nil {
+		g.live = map[string]*session.Session{}
+	}
+	if _, exists := g.live[id]; exists {
+		allow := g.bootstrapOK
+		if g.extra[id] || allow == nil || !allow(id) {
+			return fmt.Errorf("refused")
+		}
+		if g.extra == nil {
+			g.extra = map[string]bool{}
+		}
+		g.extra[id] = true
+	}
+	g.live[id] = sess
+	return nil
+}
+
 func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, requestID, callerKey, targetKey string, key session.HandshakeKey, ready func(*session.Session)) error {
 	_, span := startAcceptSpan(ctx)
 	status := "refused"
 	defer endAcceptSpan(&span, &status)
-	g.mu.Lock()
-	_, spent := g.live[requestID]
-	check := g.readable
-	g.mu.Unlock()
-	if check != nil && !check(requestID) {
+	if check := g.readable; check != nil && !check(requestID) {
 		_ = conn.Close(websocket.StatusPolicyViolation, "")
 		return fmt.Errorf("refused")
 	}
-	reply, sess, err := session.AcceptOffer(msg, requestID, callerKey, targetKey, key, spent)
+	reply, sess, err := session.AcceptOffer(msg, requestID, callerKey, targetKey, key, g.alreadyAdmitted(requestID))
 	if err != nil {
 		_ = conn.Close(websocket.StatusPolicyViolation, "")
 		return err
@@ -103,12 +142,10 @@ func (g *Gate) finishAdmit(ctx context.Context, conn byteConn, msg []byte, reque
 	if err := conn.Write(ctx, websocket.MessageBinary, reply); err != nil {
 		return err
 	}
-	g.mu.Lock()
-	if g.live == nil {
-		g.live = make(map[string]*session.Session)
+	if err := g.admit(requestID, sess); err != nil {
+		_ = conn.Close(websocket.StatusPolicyViolation, "")
+		return err
 	}
-	g.live[requestID] = sess
-	g.mu.Unlock()
 	status = "accepted"
 	endAcceptSpan(&span, &status)
 	if ready != nil {

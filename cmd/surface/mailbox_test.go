@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -229,6 +230,103 @@ func TestHeartbeatCollectsWhenOpen(t *testing.T) {
 	defer mu.Unlock()
 	if gets != 1 {
 		t.Fatalf("gets %d", gets)
+	}
+}
+
+func TestMailboxDuringBootstrap(t *testing.T) {
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
+	setAttemptBudget(4 * time.Second)
+	setDialTimeout(40 * time.Millisecond)
+	setAcceptPoll(20 * time.Millisecond)
+	t.Cleanup(func() {
+		setAttemptBudget(prevBudget)
+		setDialTimeout(prevDial)
+		setAcceptPoll(prevPoll)
+	})
+	base, _ := startPathConnector(t)
+	relayAddr, copied := startSplicer(t)
+	dialer, listener := startPathPair(t, base, "dev", "box-alice", "box-bob", "", relayAddr, "", relayAddr)
+	rewritePeer(t, base, "dev", listener.app.myKey, "127.0.0.1:1")
+	var mu sync.Mutex
+	stored := map[string][]byte{}
+	boxSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.Method {
+		case http.MethodPut:
+			stored[r.URL.Path] = append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			var rows []map[string]string
+			for path, raw := range stored {
+				var stage struct {
+					Body string `json:"body"`
+				}
+				if json.Unmarshal(raw, &stage) == nil && stage.Body != "" {
+					id := path[strings.LastIndex(path, "/")+1:]
+					rows = append(rows, map[string]string{"id": id, "body": stage.Body})
+				}
+			}
+			_ = json.NewEncoder(w).Encode(rows)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer boxSrv.Close()
+	openBox := func(a *app, me string) *mailbox.Box {
+		box, err := mailbox.Open(mailbox.Config{
+			Dir: t.TempDir(), Me: me, TTL: time.Hour, Endpoint: boxSrv.URL, Bearer: "dev",
+			Busy: func(string) bool { return false },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.box = box
+		return box
+	}
+	alice := openBox(dialer.app, "alice")
+	bob := openBox(listener.app, "bob")
+	if err := alice.Hold("bob", bob.Public().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.Hold("alice", alice.Public().String()); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
+	acceptPath(t, base, "dev", listener)
+	waitPathLine(t, dialer.buf, connectedPrompt(true), 3*time.Second)
+	leave := captureStdout(t, func() {
+		if err := dialer.app.handleLine("leave bob bootstrap-secret"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(leave, "staged") || bytes.Contains(copied.Bytes(), []byte("bootstrap-secret")) {
+		t.Fatalf("leave %q relay %d", leave, copied.Len())
+	}
+	waitPathLine(t, dialer.buf, phraseRelayStopped, 6*time.Second)
+	again := captureStdout(t, func() {
+		if err := dialer.app.handleLine("leave bob after-secret"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(again, "staged") {
+		t.Fatalf("after %q", again)
+	}
+	var got []string
+	if err := bob.Collect(context.Background(), func(d mailbox.Delivered) error {
+		got = append(got, d.Text)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, "\n")
+	if !strings.Contains(joined, "bootstrap-secret") || !strings.Contains(joined, "after-secret") {
+		t.Fatalf("read %q", joined)
+	}
+	if bytes.Contains(copied.Bytes(), []byte("bootstrap-secret")) || bytes.Contains(copied.Bytes(), []byte("after-secret")) {
+		t.Fatal("mailbox bytes crossed the relay")
 	}
 }
 

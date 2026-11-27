@@ -23,23 +23,23 @@ import (
 )
 
 func TestPathHarnesses(t *testing.T) {
-	if attemptBudget != 30*time.Second {
-		t.Fatalf("budget %s", attemptBudget)
+	if loadAttemptBudget() != 20*time.Second {
+		t.Fatalf("budget %s", loadAttemptBudget())
 	}
-	if dialTimeout != 2*time.Second {
-		t.Fatalf("dial timeout %s", dialTimeout)
+	if loadDialTimeout() != 2*time.Second {
+		t.Fatalf("dial timeout %s", loadDialTimeout())
 	}
-	if acceptPoll != time.Second {
-		t.Fatalf("poll %s", acceptPoll)
+	if loadAcceptPoll() != time.Second {
+		t.Fatalf("poll %s", loadAcceptPoll())
 	}
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(2500 * time.Millisecond)
 	setDialTimeout(800 * time.Millisecond)
-	prevPoll := acceptPoll
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
-		setAttemptBudget(30 * time.Second)
-		setDialTimeout(2 * time.Second)
-		acceptPoll = prevPoll
+		setAttemptBudget(prevBudget)
+		setDialTimeout(prevDial)
+		setAcceptPoll(prevPoll)
 	})
 
 	base, handlers := startPathConnector(t)
@@ -200,7 +200,7 @@ func TestPathHarnesses(t *testing.T) {
 		if !exactLine(listener.buf.String(), "rejected") {
 			t.Fatalf("listener %q", listener.buf.String())
 		}
-		if exactLine(listener.buf.String(), "traversal failed") || exactLine(dialer.buf.String(), "traversal failed") || strings.Contains(stdout, "traversal failed") {
+		if failureShown(listener.buf.String()) || failureShown(dialer.buf.String()) || failureShown(stdout) {
 			t.Fatalf("unexpected failure listener %q dialer %q stdout %q", listener.buf.String(), dialer.buf.String(), stdout)
 		}
 		if !strings.Contains(stdout, "connect error: rejected") {
@@ -213,15 +213,12 @@ func TestPathHarnesses(t *testing.T) {
 		rewritePeer(t, base, token, listener.app.myKey, "127.0.0.1:1")
 		go func() { _ = dialer.app.handleLine("connect " + listener.app.myKey) }()
 		acceptPath(t, base, token, listener)
-		waitPathLine(t, dialer.buf, "accepted — dialing 127.0.0.1:1", 2*time.Second)
+		waitPathLine(t, dialer.buf, phraseNoRelay, 4*time.Second)
+		waitPathLine(t, listener.buf, phraseNoRelay, 4*time.Second)
 		if err := dialer.app.handleLine("quit"); err != nil && !errors.Is(err, errStop) {
 			t.Fatal(err)
 		}
-		waitPathLine(t, listener.buf, "traversal failed", 4*time.Second)
 		time.Sleep(200 * time.Millisecond)
-		if exactLine(dialer.buf.String(), "traversal failed") {
-			t.Fatalf("dialer printed failure %q", dialer.buf.String())
-		}
 		if exactLine(dialer.buf.String(), connectedPrompt(true)) || exactLine(listener.buf.String(), connectedPrompt(false)) {
 			t.Fatalf("connected dialer %q listener %q", dialer.buf.String(), listener.buf.String())
 		}
@@ -263,16 +260,16 @@ func TestPathHarnesses(t *testing.T) {
 	})
 
 	t.Run("budget from accept", func(t *testing.T) {
-		prevBudget := attemptBudget
-		prevDial := dialTimeout
-		prevPoll := acceptPoll
+		prevBudget := loadAttemptBudget()
+		prevDial := loadDialTimeout()
+		prevPoll := loadAcceptPoll()
 		setAttemptBudget(500 * time.Millisecond)
 		setDialTimeout(40 * time.Millisecond)
-		acceptPoll = 400 * time.Millisecond
+		setAcceptPoll(400 * time.Millisecond)
 		t.Cleanup(func() {
 			setAttemptBudget(prevBudget)
 			setDialTimeout(prevDial)
-			acceptPoll = prevPoll
+			setAcceptPoll(prevPoll)
 		})
 		dialer, listener := startPathPair(t, base, token, "bound-alice", "bound-bob", "", "", "", "")
 		rewritePeer(t, base, token, listener.app.myKey, "127.0.0.1:1")
@@ -285,14 +282,14 @@ func TestPathHarnesses(t *testing.T) {
 		}
 		acceptedAt := time.Now()
 		const slack = 80 * time.Millisecond
-		limit := attemptBudget + slack
-		dialerAt := waitPathLineAt(t, dialer.buf, "traversal failed", 3*time.Second)
-		listenerAt := waitPathLineAt(t, listener.buf, "traversal failed", 3*time.Second)
+		limit := loadAttemptBudget() + slack
+		dialerAt := waitPathLineAt(t, dialer.buf, phraseNoRelay, 3*time.Second)
+		listenerAt := waitPathLineAt(t, listener.buf, phraseNoRelay, 3*time.Second)
 		if d := dialerAt.Sub(acceptedAt); d > limit {
-			t.Fatalf("dialer outcome %s after accept, budget %s", d, attemptBudget)
+			t.Fatalf("dialer outcome %s after accept, budget %s", d, loadAttemptBudget())
 		}
 		if d := listenerAt.Sub(acceptedAt); d > limit {
-			t.Fatalf("listener outcome %s after accept, budget %s", d, attemptBudget)
+			t.Fatalf("listener outcome %s after accept, budget %s", d, loadAttemptBudget())
 		}
 		if exactLine(dialer.buf.String(), connectedPrompt(true)) || exactLine(listener.buf.String(), connectedPrompt(false)) {
 			t.Fatalf("connected dialer %q listener %q", dialer.buf.String(), listener.buf.String())
@@ -606,21 +603,34 @@ func assertPathConnected(t *testing.T, dialer, listener *lockedBuffer) {
 	if !exactLine(dialer.String(), connectedPrompt(true)) || !exactLine(listener.String(), connectedPrompt(false)) {
 		t.Fatalf("dialer %q listener %q", dialer.String(), listener.String())
 	}
-	if exactLine(dialer.String(), "traversal failed") || exactLine(listener.String(), "traversal failed") {
+	if failureShown(dialer.String()) || failureShown(listener.String()) {
 		t.Fatalf("failed dialer %q listener %q", dialer.String(), listener.String())
 	}
 }
 
+func failureShown(text string) bool {
+	return exactLine(text, "traversal failed") || exactLine(text, phraseRelayStopped) || exactLine(text, phraseNoRelay)
+}
+
+func failurePhraseFor(a *app) string {
+	if strings.TrimSpace(a.relayAddr) != "" {
+		return phraseRelayStopped
+	}
+	return phraseNoRelay
+}
+
 func assertPathFailed(t *testing.T, dialer, listener *pathApp) {
 	t.Helper()
-	waitPathLine(t, dialer.buf, "traversal failed", 4*time.Second)
-	waitPathLine(t, listener.buf, "traversal failed", 4*time.Second)
+	wait := loadAttemptBudget() + 2*time.Second
+	waitPathLine(t, dialer.buf, failurePhraseFor(dialer.app), wait)
+	waitPathLine(t, listener.buf, failurePhraseFor(listener.app), wait)
 	if exactLine(dialer.buf.String(), connectedPrompt(true)) || exactLine(listener.buf.String(), connectedPrompt(false)) {
 		t.Fatalf("connected dialer %q listener %q", dialer.buf.String(), listener.buf.String())
 	}
 	for _, side := range []*pathApp{dialer, listener} {
+		phrase := failurePhraseFor(side.app)
 		for _, line := range strings.Split(side.buf.String(), "\n") {
-			if line != "traversal failed" {
+			if line != phrase {
 				continue
 			}
 			if strings.Contains(line, side.app.myKey) || strings.Contains(line, "127.0.0.1") {
