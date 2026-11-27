@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0] - 2026-11-27
+
+**The Borrowed Relay**
+
+### Added
+
+- A configured relay can carry a live chat only until a direct handshake succeeds, and no longer than 20 seconds. The same chat keeps its lines, then the relay stops.
+- `/limit` sets the session chat limit from 1 to 32. `/limit save` writes `surface-limits/config.json` with an audit row. `/audit` shows recent rows, and `/audit apply` writes a new row from an older one.
+- The status line warns in yellow one chat under the limit and in red when the limit is reached. Open chats stay open if the limit is lowered.
+
+### Changed
+
+- A failed attempt with a relay says `direct connection was not established in time; the temporary relay has stopped`. With no relay it says `direct connection was not established`.
+- `--max-chats`, `SURFACE_MAX_CHATS`, or the config file applies to that run only and does not change the saved limit.
+- Builds use Go 1.27.4.
+
 ## [0.1.1] - 2026-10-21
 
 **The Quiet Relay**

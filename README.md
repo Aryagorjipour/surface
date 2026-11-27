@@ -23,7 +23,7 @@ just help
 
 ## Publish a release
 
-**Latest release:** [v0.1.0](https://github.com/Aryagorjipour/surface/releases/tag/v0.1.1)
+**Latest release:** [v0.2.0](https://github.com/Aryagorjipour/surface/releases/tag/v0.2.0)
 
 Push a tag that matches `vMAJOR.MINOR.PATCH`.
 The tag has no leading zeros and no pre-release suffix.
