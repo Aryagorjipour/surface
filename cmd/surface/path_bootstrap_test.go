@@ -13,20 +13,20 @@ import (
 )
 
 func TestAttemptBudgetIs20s(t *testing.T) {
-	if attemptBudget != 20*time.Second {
-		t.Fatalf("budget %s", attemptBudget)
+	if loadAttemptBudget() != 20*time.Second {
+		t.Fatalf("budget %s", loadAttemptBudget())
 	}
 }
 
 func TestRelayCutoverKeepsLines(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(8 * time.Second)
 	setDialTimeout(40 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 
 	base, _ := startPathConnector(t)
@@ -75,14 +75,14 @@ func TestRelayCutoverKeepsLines(t *testing.T) {
 }
 
 func TestRelayBudgetRemovesChat(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(2 * time.Second)
 	setDialTimeout(30 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, _ := startSplicer(t)
@@ -103,14 +103,14 @@ func TestRelayBudgetRemovesChat(t *testing.T) {
 }
 
 func TestNoRelayFailsWithoutDial(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(5 * time.Second)
 	setDialTimeout(30 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, accepts := listenRelayCount(t)
@@ -127,14 +127,14 @@ func TestNoRelayFailsWithoutDial(t *testing.T) {
 }
 
 func TestDirectResumeSkipsRelay(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(8 * time.Second)
 	setDialTimeout(200 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, accepts := listenRelayCount(t)
@@ -167,14 +167,14 @@ func TestDirectResumeSkipsRelay(t *testing.T) {
 }
 
 func TestTwoChatsStopOnlyOneRelay(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(6 * time.Second)
 	setDialTimeout(40 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, _ := startSplicer(t)
@@ -205,14 +205,14 @@ func TestTwoChatsStopOnlyOneRelay(t *testing.T) {
 }
 
 func TestOneSidedDirectSocketKeepsRelay(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(8 * time.Second)
 	setDialTimeout(40 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, _ := startSplicer(t)

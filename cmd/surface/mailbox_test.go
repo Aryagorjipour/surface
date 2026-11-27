@@ -234,14 +234,14 @@ func TestHeartbeatCollectsWhenOpen(t *testing.T) {
 }
 
 func TestMailboxDuringBootstrap(t *testing.T) {
-	prevBudget, prevDial, prevPoll := attemptBudget, dialTimeout, acceptPoll
+	prevBudget, prevDial, prevPoll := loadAttemptBudget(), loadDialTimeout(), loadAcceptPoll()
 	setAttemptBudget(4 * time.Second)
 	setDialTimeout(40 * time.Millisecond)
-	acceptPoll = 20 * time.Millisecond
+	setAcceptPoll(20 * time.Millisecond)
 	t.Cleanup(func() {
 		setAttemptBudget(prevBudget)
 		setDialTimeout(prevDial)
-		acceptPoll = prevPoll
+		setAcceptPoll(prevPoll)
 	})
 	base, _ := startPathConnector(t)
 	relayAddr, copied := startSplicer(t)

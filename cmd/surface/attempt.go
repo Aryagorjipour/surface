@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Aryagorjipour/surface/internal/hostport"
@@ -20,12 +21,24 @@ import (
 )
 
 var (
-	attemptBudget = 20 * time.Second
-	dialTimeout   = 2 * time.Second
-	acceptPoll    = time.Second
+	attemptBudget atomic.Int64
+	dialTimeout   atomic.Int64
+	acceptPoll    atomic.Int64
 	punchEvery    = 100 * time.Millisecond
 	wsClient      = &http.Client{Transport: happyTransport()}
 )
+
+func init() {
+	attemptBudget.Store(int64(20 * time.Second))
+	dialTimeout.Store(int64(2 * time.Second))
+	acceptPoll.Store(int64(time.Second))
+}
+
+func loadAttemptBudget() time.Duration { return time.Duration(attemptBudget.Load()) }
+
+func loadDialTimeout() time.Duration { return time.Duration(dialTimeout.Load()) }
+
+func loadAcceptPoll() time.Duration { return time.Duration(acceptPoll.Load()) }
 
 func happyTransport() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -67,14 +80,16 @@ func dialWebSocket(ctx context.Context, addr hostport.Addr) (*websocket.Conn, er
 	return dialPeer(ctx, addr, false, nil)
 }
 
-func setAttemptBudget(d time.Duration) { attemptBudget = d }
+func setAttemptBudget(d time.Duration) { attemptBudget.Store(int64(d)) }
 
-func setDialTimeout(d time.Duration) { dialTimeout = d }
+func setDialTimeout(d time.Duration) { dialTimeout.Store(int64(d)) }
+
+func setAcceptPoll(d time.Duration) { acceptPoll.Store(int64(d)) }
 
 func (a *app) attempt(dialer bool, addr, id, caller, target string, proof session.HandshakeKey) error {
-	budget := attemptBudget
-	if dialer && acceptPoll < budget {
-		budget -= acceptPoll
+	budget := loadAttemptBudget()
+	if dialer && loadAcceptPoll() < budget {
+		budget -= loadAcceptPoll()
 	}
 	ctx, cancel := context.WithDeadline(a.ctx, time.Now().Add(budget))
 	started := make(chan struct{})
@@ -101,7 +116,7 @@ func (a *app) runAttempt(ctx context.Context, dialer bool, addr, id, caller, tar
 		if a.dialDirect(ctx, addr, id, caller, target, proof) {
 			return
 		}
-	} else if a.waitDirect(ctx, dialTimeout, id) {
+	} else if a.waitDirect(ctx, loadDialTimeout(), id) {
 		return
 	}
 	if ctx.Err() != nil {
@@ -238,31 +253,12 @@ func (a *app) chatting(id string) bool {
 	return a.registry.Has(ConvID(id))
 }
 
-func (a *app) waitConnected(ctx context.Context, d time.Duration, id string) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if a.chatting(id) {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return a.chatting(id)
-		case <-timer.C:
-			return a.chatting(id)
-		case <-tick.C:
-		}
-	}
-}
-
 func (a *app) dialDirect(ctx context.Context, raw, id, caller, target string, proof session.HandshakeKey) bool {
 	addr, err := hostport.Parse(raw)
 	if err != nil {
 		return false
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	dialCtx, cancel := context.WithTimeout(ctx, loadDialTimeout())
 	c, err := dialPeer(dialCtx, addr, a.directSecure, a.directRoots)
 	cancel()
 	if err != nil {

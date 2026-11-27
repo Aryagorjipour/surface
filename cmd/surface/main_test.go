@@ -490,9 +490,9 @@ func TestHandleLineQuitEndsOnlyFocused(t *testing.T) {
 }
 
 func TestConnectReportsRateLimit(t *testing.T) {
-	prev := acceptPoll
-	acceptPoll = time.Millisecond
-	t.Cleanup(func() { acceptPoll = prev })
+	prev := loadAcceptPoll()
+	setAcceptPoll(time.Millisecond)
+	t.Cleanup(func() { setAcceptPoll(prev) })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

@@ -746,7 +746,7 @@ func (a *app) doConnect(target string) error {
 	a.println("request created:", cr.RequestID)
 
 	for i := 0; i < 30; i++ {
-		time.Sleep(acceptPoll)
+		time.Sleep(loadAcceptPoll())
 		resp, err := a.do(http.MethodGet, a.base+"/requests/"+cr.RequestID, nil)
 		if err != nil {
 			continue
