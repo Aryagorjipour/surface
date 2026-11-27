@@ -52,9 +52,9 @@ On the connector, a positive duration creates the SQLite table `mailbox` and mou
 
 `Leave` stages one line. The line is at most 1024 bytes.
 
-`expires_at` is the stage time plus the connector duration. The connector deletes the row when that time is reached.
+`expires_at` is the stage time plus the connector duration. A maintenance pass deletes the row once `expires_at` has passed. The default pass interval is 1 second.
 
-A caller with the connector token can read the stored blob. Opening the line needs the recipient mailbox key.
+A caller with the connector token can read the stored blob. Opening the line needs the recipient mailbox private key and the sender public key in that client's mailbox book.
 
 ## Mailbox files on the surface machine
 
@@ -120,4 +120,4 @@ The relay is not a connector feature. `surface` dials a TCP address from `--rela
 
 `relayPath` writes a plaintext header, then length-prefixed messages. The header is the line `surface-relay-v1` and the request id. Each later message is a 4-byte length plus the bytes the session produced. A chat line uses the sealed frame from `session.Seal`. The handshake offer on that socket also carries the request id and the caller key in the clear. The relay can see the length of each write and the time of each write.
 
-The attempt deadline defaults to 20 seconds, measured from the start of the attempt. The dialer shortens that deadline by the accept poll, which defaults to 1 second. The relay uses that same deadline. It stops sooner when a direct handshake replaces it.
+The attempt deadline defaults to 20 seconds, measured from the start of the attempt. The dialer shortens that deadline by the accept poll, which defaults to 1 second. The relay runs inside that same deadline. A direct handshake replaces the relay sooner. If the deadline passes while the chat is still on the relay, `DropBootstrap` cancels that chat.
