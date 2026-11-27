@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -322,5 +323,69 @@ func TestMouseClickDismissesToast(t *testing.T) {
 	})
 	if len(next.toasts) != 0 {
 		t.Fatalf("toasts left %+v", next.toasts)
+	}
+}
+
+func TestLimitWarning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &app{ctx: ctx, cancel: cancel, maxChats: 4}
+	a.initRegistry()
+	s := newScreen(a)
+	var open []*Conversation
+	for i, peer := range []string{"ann", "bea", "cam"} {
+		open = append(open, attachPipe(t, a.registry, ConvID("w"+string(rune('a'+i))), peer))
+	}
+	view := s.View()
+	if !strings.Contains(view, "approaching chat limit") || strings.Contains(view, "chat limit reached") {
+		t.Fatalf("view %q toasts %v", view, a.limitToasts)
+	}
+	if len(a.limitToasts) != 0 {
+		t.Fatalf("toast %v", a.limitToasts)
+	}
+	open = append(open, attachPipe(t, a.registry, "wd", "dee"))
+	view = s.View()
+	if !strings.Contains(view, "chat limit reached") || len(a.limitToasts) != 1 || a.limitToasts[0] != "chat limit reached" {
+		t.Fatalf("view %q toasts %v", view, a.limitToasts)
+	}
+	before := a.registry.Len()
+	stdout := captureStdout(t, func() {
+		if err := a.handleLine("connect extra"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if a.registry.Len() != before || !strings.Contains(stdout, "new chats are blocked") {
+		t.Fatalf("len %d out %q", a.registry.Len(), stdout)
+	}
+	if err := a.setSessionLimit(2); err != nil {
+		t.Fatal(err)
+	}
+	view = s.View()
+	if !strings.Contains(view, "open chats stay open; new chats are blocked") {
+		t.Fatalf("view %q", view)
+	}
+	if a.limitToasts[len(a.limitToasts)-1] != "open chats stay open; new chats are blocked" {
+		t.Fatalf("toasts %v", a.limitToasts)
+	}
+	if err := a.setSessionLimit(6); err != nil {
+		t.Fatal(err)
+	}
+	view = s.View()
+	if strings.Contains(view, "approaching chat limit") || strings.Contains(view, "chat limit reached") {
+		t.Fatalf("view %q", view)
+	}
+	open[0].cancel()
+	waitGone(t, a.registry, open[0].ID())
+	_ = a.setSessionLimit(4)
+	for a.registry.Len() > 1 {
+		open[a.registry.Len()-1].cancel()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := a.setSessionLimit(1); err != nil {
+		t.Fatal(err)
+	}
+	view = s.View()
+	if strings.Contains(view, "approaching chat limit") || !strings.Contains(view, "chat limit reached") {
+		t.Fatalf("limit 1 view %q", view)
 	}
 }

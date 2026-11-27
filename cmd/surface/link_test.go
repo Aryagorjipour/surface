@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -214,7 +215,12 @@ func TestRelayReadStopsOnCancel(t *testing.T) {
 }
 
 func TestRelayWriteStopsOnCancel(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
+		})
+	}}
+	ln, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +233,12 @@ func TestRelayWriteStopsOnCancel(t *testing.T) {
 		}
 		accepted <- conn
 	}()
-	client, err := net.Dial("tcp", ln.Addr().String())
+	dialer := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096)
+		})
+	}}
+	client, err := dialer.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,18 +275,20 @@ func TestRelayWriteStopsOnCancel(t *testing.T) {
 
 func fillTCPWrite(t *testing.T, conn net.Conn) {
 	t.Helper()
-	_ = conn.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
-	junk := bytes.Repeat([]byte{1}, 16*1024)
-	blocked := false
-	for i := 0; i < 1000 && !blocked; i++ {
-		if _, err := conn.Write(junk); err != nil {
-			blocked = true
-		}
-	}
-	_ = conn.SetWriteDeadline(time.Time{})
-	if !blocked {
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
+	if !writeUntilBlock(conn, bytes.Repeat([]byte{1}, 1024), 64) {
 		t.Fatal("write buffer did not fill")
 	}
+}
+
+func writeUntilBlock(conn net.Conn, payload []byte, limit int) bool {
+	for i := 0; i < limit; i++ {
+		_ = conn.SetWriteDeadline(time.Now().Add(200 * time.Millisecond))
+		if _, err := conn.Write(payload); err != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func startSplicer(t *testing.T) (string, *lockedBuffer) {

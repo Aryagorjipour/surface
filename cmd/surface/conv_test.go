@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -121,6 +122,35 @@ func TestRegistryTwoAttaches(t *testing.T) {
 	focused, ok := r.Focused()
 	if !ok || focused.ID() != b.ID() {
 		t.Fatalf("new attach should take focus, got %+v", focused)
+	}
+}
+
+func TestSetMaxKeepsOpenChats(t *testing.T) {
+	t.Chdir(t.TempDir())
+	r := testRegistry(t, 2)
+	first := attachPipe(t, r, "req-a", "alice")
+	second := attachPipe(t, r, "req-b", "bob")
+	r.SetMax(1)
+	if !r.Has(first.ID()) || !r.Has(second.ID()) || r.Len() != 2 {
+		t.Fatal("SetMax removed an open chat")
+	}
+	dialer, _ := admittedPair(t)
+	conn, other := pipePair()
+	t.Cleanup(func() {
+		_ = conn.CloseNow()
+		_ = other.CloseNow()
+	})
+	_, err := r.Attach(AttachReq{ID: "req-c", Peer: "carol", Sess: dialer, Conn: conn})
+	if !errors.Is(err, ErrAtCapacity) {
+		t.Fatalf("attach: %v", err)
+	}
+	r.SetMax(4)
+	third := attachPipe(t, r, "req-d", "dave")
+	if !r.Has(third.ID()) || r.Len() != 3 {
+		t.Fatalf("len %d", r.Len())
+	}
+	if _, err := os.Stat("surface-limits/config.json"); !os.IsNotExist(err) {
+		t.Fatal("SetMax wrote a file")
 	}
 }
 

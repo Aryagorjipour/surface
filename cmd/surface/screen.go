@@ -88,22 +88,24 @@ const (
 )
 
 type screen struct {
-	app      *app
-	phase    phase
-	focus    focus
-	rows     []row
-	sel      int
-	lines    []string
-	follow   bool
-	top      int
-	compose  string
-	cursor   int
-	width    int
-	height   int
-	myKey    string
-	hint     string
-	toasts   []toast
-	toastSeq uint64
+	app        *app
+	phase      phase
+	focus      focus
+	rows       []row
+	sel        int
+	lines      []string
+	follow     bool
+	top        int
+	compose    string
+	cursor     int
+	width      int
+	height     int
+	myKey      string
+	hint       string
+	toasts     []toast
+	toastSeq   uint64
+	limitText  string
+	limitLevel toastLevel
 }
 
 func newScreen(a *app) screen {
@@ -156,7 +158,17 @@ func (s screen) View() string {
 		sep := styleSep.Render("│")
 		rows = append(rows, l+sep+r)
 	}
-	rows = append(rows, styleStatus.Width(width).Render(fit(s.statusText(), width)))
+	s = s.pullLimit()
+	warn := s.limitText
+	warnStyle := lipgloss.NewStyle().Foreground(colorWarn)
+	if s.limitLevel == toastError {
+		warnStyle = lipgloss.NewStyle().Foreground(colorErr)
+	}
+	status := styleStatus.Width(width).Render(fit(s.statusText(), width))
+	if warn != "" {
+		status += warnStyle.Render(" " + warn)
+	}
+	rows = append(rows, status)
 	rows = append(rows, styleCompose(s.focus == focusCompose).Width(width).Render(fit(s.composeText(), width)))
 	rows = s.overlayToasts(rows, width)
 	return strings.Join(rows, "\n")
@@ -695,6 +707,22 @@ func (s screen) liveIDFor(peer string) ConvID {
 		return ""
 	}
 	return s.app.registry.IDForPeer(peer)
+}
+
+func (s screen) pullLimit() screen {
+	if s.app == nil {
+		return s
+	}
+	s.app.refreshLimitWarning()
+	s.limitText = s.app.limitWarn
+	s.limitLevel = s.app.limitLevel
+	if s.app.limitToast == "" {
+		return s
+	}
+	s.toastSeq++
+	s.toasts = append(s.toasts, toast{id: s.toastSeq, level: s.limitLevel, text: s.app.limitToast})
+	s.app.limitToast = ""
+	return s
 }
 
 func (s screen) statusText() string {

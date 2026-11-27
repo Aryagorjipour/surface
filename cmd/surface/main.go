@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,17 +61,28 @@ type app struct {
 	directSecure bool
 	directRoots  *x509.CertPool
 
-	mu        sync.Mutex
-	presence  string
-	fromKey   map[string]savedCaller
-	gate      Gate
-	registry  *Registry
-	maxChats  int
-	punchAddr string
-	relayAddr string
-	out       io.Writer
-	deskCh    chan tea.Msg
-	box       *mailbox.Box
+	mu           sync.Mutex
+	presence     string
+	fromKey      map[string]savedCaller
+	gate         Gate
+	registry     *Registry
+	maxChats     int
+	maxNamed     bool
+	limitsRoot   string
+	savedPresent bool
+	savedLimit   int
+	savedVersion int
+	auditRows    []auditEntry
+	auditShow    int
+	limitWarn    string
+	limitLevel   toastLevel
+	limitToast   string
+	limitToasts  []string
+	punchAddr    string
+	relayAddr    string
+	out          io.Writer
+	deskCh       chan tea.Msg
+	box          *mailbox.Box
 }
 
 func main() {
@@ -151,8 +163,10 @@ func run(args []string, lookup func(string) (string, bool), logger *slog.Logger,
 		punchAddr:    cfg.punch,
 		relayAddr:    cfg.relay,
 		maxChats:     cfg.maxChats,
+		maxNamed:     cfg.maxNamed,
 	}
 	a.initRegistry()
+	a.loadSavedLimit()
 	if err := a.openBox(cfg.mailbox); err != nil {
 		return err
 	}
@@ -233,9 +247,54 @@ func parseChatCommand(line string) (chatCommand, bool) {
 		return chatCommand{kind: chatCmdFocus, ref: ref}, true
 	case "/quit":
 		return chatCommand{kind: chatCmdQuit}, true
+	case "/limit":
+		return parseLimitCommand(line)
+	case "/audit":
+		return parseAuditCommand(line)
 	default:
 		return chatCommand{}, false
 	}
+}
+
+func parseLimitCommand(line string) (chatCommand, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 1 {
+		return chatCommand{kind: chatCmdLimit}, true
+	}
+	if fields[1] == "save" {
+		reason := ""
+		if idx := strings.Index(line, "save"); idx >= 0 {
+			reason = strings.TrimSpace(line[idx+len("save"):])
+		}
+		return chatCommand{kind: chatCmdLimitSave, ref: reason}, true
+	}
+	n, err := strconv.Atoi(fields[1])
+	if err != nil || len(fields) != 2 {
+		return chatCommand{kind: chatCmdLimitBad}, true
+	}
+	return chatCommand{kind: chatCmdLimitSet, n: n}, true
+}
+
+func parseAuditCommand(line string) (chatCommand, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 1 {
+		return chatCommand{kind: chatCmdAudit}, true
+	}
+	if fields[1] == "apply" && len(fields) == 3 {
+		n, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return chatCommand{kind: chatCmdAuditBad}, true
+		}
+		return chatCommand{kind: chatCmdAuditApply, n: n}, true
+	}
+	if len(fields) == 2 {
+		n, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return chatCommand{kind: chatCmdAuditBad}, true
+		}
+		return chatCommand{kind: chatCmdAuditCount, n: n}, true
+	}
+	return chatCommand{kind: chatCmdAuditBad}, true
 }
 
 func parseLobbyVerb(line string) (string, []string, bool) {
@@ -257,11 +316,20 @@ const (
 	chatCmdChats chatCmdKind = iota
 	chatCmdFocus
 	chatCmdQuit
+	chatCmdLimit
+	chatCmdLimitSet
+	chatCmdLimitBad
+	chatCmdLimitSave
+	chatCmdAudit
+	chatCmdAuditCount
+	chatCmdAuditBad
+	chatCmdAuditApply
 )
 
 type chatCommand struct {
 	kind chatCmdKind
 	ref  string
+	n    int
 }
 
 func (a *app) dispatchChatCommand(cmd chatCommand) error {
@@ -283,6 +351,27 @@ func (a *app) dispatchChatCommand(cmd chatCommand) error {
 		if c, ok := a.registry.Focused(); ok {
 			c.Quit()
 		}
+	case chatCmdLimit:
+		a.printLimit()
+	case chatCmdLimitSet:
+		if err := a.setSessionLimit(cmd.n); err != nil {
+			a.println(err.Error())
+		}
+	case chatCmdLimitBad:
+		a.println(errLimitRange.Error())
+	case chatCmdLimitSave:
+		a.saveSessionLimit(cmd.ref)
+	case chatCmdAudit:
+		if a.auditShow == 0 {
+			a.auditShow = 10
+		}
+		a.showAudit(a.auditShow)
+	case chatCmdAuditCount:
+		a.showAudit(cmd.n)
+	case chatCmdAuditBad:
+		a.println(errAuditCount.Error())
+	case chatCmdAuditApply:
+		a.applyAudit(cmd.n)
 	}
 	return nil
 }
@@ -313,7 +402,7 @@ func (a *app) handleLobbyVerb(verb string, rest []string) error {
 			return nil
 		}
 		if a.registry.AtCapacity() {
-			a.println("at capacity")
+			a.println("new chats are blocked")
 			a.markPhase(phaseLobby)
 			return nil
 		}
@@ -734,8 +823,14 @@ func (a *app) onIncoming(c byteConn) {
 	ready := func(sess *session.Session) {
 		admitted = true
 		id := a.gate.idOf(sess)
+		if a.registry != nil && a.registry.Bootstrap(ConvID(id)) {
+			if err := a.registry.Migrate(ConvID(id), c, sess); err == nil {
+				a.say("\n" + connectedPrompt(false))
+				return
+			}
+		}
 		peer := a.callerFor(id)
-		if a.beginChat(c, sess, false, hostport.Addr{}, ConvID(id), peer) {
+		if a.beginChat(c, sess, false, hostport.Addr{}, ConvID(id), peer, false, time.Time{}) {
 			a.say("\n" + connectedPrompt(false))
 			return
 		}
@@ -800,7 +895,7 @@ func (a *app) callerSnap(id string) savedCaller {
 	return saved
 }
 
-func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hostport.Addr, id ConvID, peer string) bool {
+func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hostport.Addr, id ConvID, peer string, bootstrap bool, until time.Time) bool {
 	a.initRegistry()
 	_, err := a.registry.Attach(AttachReq{
 		ID:     id,
@@ -815,7 +910,11 @@ func (a *app) beginChat(c byteConn, sess *session.Session, dialer bool, addr hos
 	if err != nil {
 		return false
 	}
+	if bootstrap {
+		a.registry.MarkBootstrap(id, until)
+	}
 	a.markPhase(phaseChat)
+	a.refreshLimitWarning()
 	return true
 }
 
@@ -833,6 +932,9 @@ func (a *app) initRegistry() {
 	}
 	a.registry = NewRegistry(ctx, max, a.resumeWindow)
 	a.gate.until = a.registry.ResumeUntil
+	a.gate.bootstrapOK = func(id string) bool {
+		return a.registry != nil && a.registry.bootstrapOpen(ConvID(id))
+	}
 }
 
 func (a *app) pumpEvents() {
@@ -865,6 +967,7 @@ func (a *app) handleConvEvent(ev ConvEvent) {
 			a.note(note{kind: noteSelf, text: ev.Text, id: string(ev.ID), key: ev.Peer})
 		}
 	case EvEnded:
+		a.refreshLimitWarning()
 		if ev.Text == "quit" {
 			a.println("left chat")
 		} else {
