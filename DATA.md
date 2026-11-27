@@ -62,7 +62,7 @@ When its mailbox duration is positive, `surface` writes `surface-mailbox/<my-key
 
 That directory holds `identity`, `book`, `outbox`, and `inbox`. `book` stores peer names and public keys in the clear. `identity` is the mailbox private key, mode 0600. The connector does not receive this directory.
 
-This mailbox key is separate from the chat identity below.
+This mailbox key is separate from the chat identity in the Identity seed section.
 
 ## Census
 
